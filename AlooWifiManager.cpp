@@ -1,6 +1,6 @@
 #include "AlooWifiManager.h"
 #include <DNSServer.h>
-#include "mustache.hpp"
+
 // Static member initialization
 constexpr char WiFiManager::PREF_NAMESPACE[];
 constexpr char WiFiManager::PREF_SSID_KEY[];
