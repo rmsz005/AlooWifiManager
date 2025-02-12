@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <vector>               // For std::vector (if needed for dynamic arrays)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -26,26 +27,43 @@ enum class WiFiStatus {
 class WiFiManager {
 public:
   /**
-   * @brief Constructor with configurable AP credentials
-   * 
-   * @param apSsid SSID for the configuration access point
-   * @param apPassword Password for the configuration AP (empty string for open network)
+   * @brief Constructor with configurable AP credentials.
+   * @param apSsid SSID for the configuration access point.
+   * @param apPassword Password for the configuration AP (empty string for open network).
    */
   WiFiManager(const String& apSsid = "ESP32-Config", const String& apPassword = "");
   ~WiFiManager();
 
   /**
-   * @brief Starts the asynchronous WiFi management
-   * 
-   * @param runServerOnSeparateCore Run web server in separate FreeRTOS task
-   * @param serverCore CPU core for web server task
-   * @param managerCore CPU core for manager task
+   * @brief Starts the asynchronous WiFi management.
+   * @param runServerOnSeparateCore Run web server in a separate FreeRTOS task.
+   * @param serverCore CPU core for the web server task.
+   * @param managerCore CPU core for the manager task.
    */
   void begin(bool runServerOnSeparateCore = true, int serverCore = 1, int managerCore = 1);
 
+  /**
+   * @brief Get the current WiFi connection status.
+   * @return WiFiStatus current status.
+   */
   WiFiStatus getStatus();
+
+  /**
+   * @brief Process the web server client requests (if not running on a separate core).
+   */
   void processWebServer();
+
+  /**
+   * @brief Reset stored WiFi credentials.
+   * @return true if reset was successful, false otherwise.
+   */
   bool resetCredentials();
+
+  /**
+   * @brief Set the connection timeout duration for WiFi connection attempts.
+   * @param timeout Timeout in milliseconds.
+   */
+  void setConnectTimeout(unsigned long timeout);
 
 private:
   //========================================================================
@@ -59,7 +77,7 @@ private:
   WiFiStatus _status;
   SemaphoreHandle_t _statusMutex;
 
-  // Credential management
+  // Credential management for new credentials submitted via the captive portal
   String _pendingSsid;
   String _pendingPassword;
   bool _newCredentialsAvailable;
@@ -70,9 +88,10 @@ private:
   DNSServer _dnsServer;
   bool _runServerOnSeparateCore;
 
-  // Task management
+  // Task management handles
   TaskHandle_t _managerTaskHandle;
   TaskHandle_t _serverTaskHandle;
+  TaskHandle_t _monitorTaskHandle; // For automatic reconnection monitoring
   int _serverCore;
   int _managerCore;
 
@@ -82,15 +101,21 @@ private:
   static constexpr char PREF_SSID_KEY[] = "last_ssid";
   static constexpr char PREF_PASS_KEY[] = "last_pass";
 
+  // Mutex to prevent simultaneous connection attempts
+  SemaphoreHandle_t _connectionMutex;
+
+  // Connection timeout (in milliseconds) for WiFi connection attempts
+  unsigned long _connectTimeout;
+
   //========================================================================
   // Private Methods
   //========================================================================
   void ensureAPModeActive();
-  // Credential storage
+  // Credential storage helpers
   bool loadLastCredentials(String &ssid, String &password);
   bool saveLastCredentials(const String &ssid, const String &password);
 
-  // Connection management
+  // Connection management helpers
   bool tryConnect(const String &ssid, const String &password);
   void startAPMode();
   void stopAPMode();
@@ -100,7 +125,7 @@ private:
   void handleRedirect();
   bool isIp(const String& str);
 
-  // Web server handlers
+  // Web server HTTP handlers
   void handleRoot();
   void handleConnectPage();
   void handleSubmitCredentials();
@@ -108,6 +133,7 @@ private:
   // Task functions
   static void managerTask(void* param);
   static void serverTask(void* param);
+  static void monitorTask(void* param);
 };
 
 #endif // ALOO_WIFI_MANAGER_H
