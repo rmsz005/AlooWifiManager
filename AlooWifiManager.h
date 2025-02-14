@@ -31,7 +31,9 @@ enum class WiFiStatus {
   INITIALIZING,       // Manager task just started
   TRYING_TO_CONNECT,  // Actively trying to connect (stored or submitted credentials)
   AP_MODE_ACTIVE,     // AP mode active and captive portal available
-  CONNECTED           // Successfully connected to a WiFi network
+  CONNECTED,          // Successfully connected to a WiFi network
+  DISCONNECTED,        // WiFi is disconnected
+  NO_INTERNET         // Connected to WiFi but no internet access
 };
 
 //========================================================================
@@ -85,6 +87,11 @@ public:
    */
   void setConnectTimeout(unsigned long timeout);
 
+  /**
+   * @brief Forces the device to start AP mode (to allow new credentials to be submitted).
+   */
+  void forceAPMode();
+
 private:
   //========================================================================
   // Private Members
@@ -134,9 +141,46 @@ private:
   SemaphoreHandle_t _networksMutex;
 
   //========================================================================
-  // Private Methods
+  // New Private Constants for Status Polling and Endpoints
+  //========================================================================
+  static constexpr unsigned long STATUS_POLL_INTERVAL_MS = 2000;
+  static inline constexpr char STATUS_ENDPOINT[] = "/status";
+  static constexpr char NETWORKS_ENDPOINT[] = "/wifinetworks";
+  static constexpr char SUBMIT_ENDPOINT[] = "/submit";
+
+  //========================================================================
+  // Private Helper Functions for Shared Variables
+  //========================================================================
+  /**
+   * @brief Updates the internal WiFi status in a thread-safe manner.
+   * @param newStatus The new WiFiStatus.
+   */
+  void updateStatus(WiFiStatus newStatus);
+
+  /**
+   * @brief Retrieves the current WiFi status in a thread-safe manner.
+   * @return The current WiFiStatus.
+   */
+  WiFiStatus safeGetStatus();
+
+  /**
+   * @brief Sets new pending credentials (submitted via the captive portal) safely.
+   * @param ssid The new SSID.
+   * @param password The new password.
+   */
+  void setPendingCredentials(const String& ssid, const String& password);
+
+  /**
+   * @brief Checks for and retrieves pending credentials if available.
+   * @param ssid (out) The pending SSID.
+   * @param password (out) The pending password.
+   * @return True if new credentials were available; otherwise false.
+   */
+  bool fetchPendingCredentials(String &ssid, String &password);
+
   //========================================================================
   // SPIFFS and File Serving Helpers
+  //========================================================================
   /**
    * @brief Loads a file from SPIFFS.
    * @param filePath Full path to the file.
@@ -160,30 +204,65 @@ private:
    */
   void setupStaticEndpoint(const String& uri, const String& fileName, const char* defaultContent, const char* contentType);
 
-  // Credential storage helpers
+  //========================================================================
+  // Credential Storage Helpers
+  //========================================================================
   bool loadLastCredentials(String &ssid, String &password);
   bool saveLastCredentials(const String &ssid, const String &password);
 
-  // Connection management helpers
+  //========================================================================
+  // Connection Management Helpers
+  //========================================================================
+  /**
+   * @brief Internal function that attempts a connection to the given credentials.
+   * @param ssid The WiFi SSID.
+   * @param password The WiFi password.
+   * @return True if connected; otherwise false.
+   */
+  bool tryConnectInternal(const String &ssid, const String &password);
+
+  /**
+   * @brief Attempts to connect to the given WiFi credentials.
+   *        Automatically updates the status to TRYING_TO_CONNECT, CONNECTED, or DISCONNECTED.
+   * @param ssid The WiFi SSID.
+   * @param password The WiFi password.
+   * @return True if connected; otherwise false.
+   */
   bool tryConnect(const String &ssid, const String &password);
+
   void startAPMode();
   void stopAPMode();
 
-  // Captive portal functionality
+  //========================================================================
+  // Captive Portal Functionality
+  //========================================================================
   void setupCaptivePortal();
   void handleRedirect();
   bool isIp(const String& str);
 
-  // Web server HTTP handlers
+  //========================================================================
+  // Web Server HTTP Handlers
+  //========================================================================
   void handleSubmitCredentials();
   void handleWifiNetworks(); // Returns cached WiFi networks as JSON
 
-  // Task functions
+  //========================================================================
+  // Task Functions
+  //========================================================================
   static void managerTask(void* param);
   static void serverTask(void* param);
   static void monitorTask(void* param);
   static void scanTask(void* param);
+  bool hasInternetAccess();
+  /**
+   * @brief Ensures AP mode is active.
+   */
   void ensureAPModeActive();
+
+  //========================================================================
+  // Private Helper for Converting WiFiStatus to String
+  //========================================================================
+  const char* wifiStatusToString(WiFiStatus status);
 };
 
 #endif // ALOO_WIFI_MANAGER_H

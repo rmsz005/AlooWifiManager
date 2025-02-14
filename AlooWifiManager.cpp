@@ -1,6 +1,6 @@
 #include "AlooWifiManager.h"
 #include <DNSServer.h>
-
+#include <HTTPClient.h>
 // Initialize static member variables for Preferences keys
 constexpr char WiFiManager::PREF_NAMESPACE[];
 constexpr char WiFiManager::PREF_SSID_KEY[];
@@ -86,6 +86,42 @@ static const char defaultScriptJs[] =
 "if(document.getElementById('networks')) { window.onload = fetchNetworks; }";
 
 //==========================================================================
+// New Default Connecting HTML (Fallback)
+//==========================================================================
+static const char connectingHtml[] PROGMEM = R"raw(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='UTF-8'>
+  <title>Connecting</title>
+  <script>
+    function checkStatus() {
+      fetch('/status')
+        .then(response => response.ok ? response.json() : Promise.reject())
+        .then(data => {
+          if (data.status === 'CONNECTED') {
+            window.location.href = '/';
+          } else if (data.status === 'AP_MODE_ACTIVE' || data.status === 'DISCONNECTED') {
+            alert('Connection failed! Please check credentials.');
+            window.location.href = '/connect';
+          } else {
+            setTimeout(checkStatus, 2000);
+          }
+        })
+        .catch(() => setTimeout(checkStatus, 2000));
+    }
+    document.addEventListener('DOMContentLoaded', () => setTimeout(checkStatus, 2000));
+  </script>
+</head>
+<body>
+  <h1>Attempting to connect...</h1>
+  <p>Please wait while we try to connect to %s</p>
+  <p>This may take up to %lu seconds</p>
+</body>
+</html>
+)raw";
+
+//==========================================================================
 // Constructor & Destructor
 //==========================================================================
 WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, const String& webDir)
@@ -106,10 +142,10 @@ WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, const S
     _managerCore(1),
     _connectTimeout(15000) // Default connection timeout: 15 seconds
 {
-  _statusMutex    = xSemaphoreCreateMutex();
-  _pendingMutex   = xSemaphoreCreateMutex();
+  _statusMutex     = xSemaphoreCreateMutex();
+  _pendingMutex    = xSemaphoreCreateMutex();
   _connectionMutex = xSemaphoreCreateMutex();
-  _networksMutex  = xSemaphoreCreateMutex();
+  _networksMutex   = xSemaphoreCreateMutex();
 }
 
 WiFiManager::~WiFiManager() {
@@ -117,11 +153,53 @@ WiFiManager::~WiFiManager() {
   if (_serverTaskHandle) vTaskDelete(_serverTaskHandle);
   if (_monitorTaskHandle) vTaskDelete(_monitorTaskHandle);
   if (_scanTaskHandle) vTaskDelete(_scanTaskHandle);
-  if (_statusMutex) vSemaphoreDelete(_statusMutex);
-  if (_pendingMutex) vSemaphoreDelete(_pendingMutex);
+  if (_statusMutex)    vSemaphoreDelete(_statusMutex);
+  if (_pendingMutex)   vSemaphoreDelete(_pendingMutex);
   if (_connectionMutex) vSemaphoreDelete(_connectionMutex);
-  if (_networksMutex) vSemaphoreDelete(_networksMutex);
+  if (_networksMutex)  vSemaphoreDelete(_networksMutex);
   stopAPMode();
+}
+
+//==========================================================================
+// Helper Functions for Shared Variables
+//==========================================================================
+void WiFiManager::updateStatus(WiFiStatus newStatus) {
+  xSemaphoreTake(_statusMutex, portMAX_DELAY);
+  if (_status != newStatus) {
+    Serial.printf("[WM] Status: %s -> %s\n",
+      wifiStatusToString(_status), wifiStatusToString(newStatus));
+  }
+  _status = newStatus;
+  xSemaphoreGive(_statusMutex);
+}
+
+WiFiStatus WiFiManager::safeGetStatus() {
+  WiFiStatus stat;
+  xSemaphoreTake(_statusMutex, portMAX_DELAY);
+  stat = _status;
+  xSemaphoreGive(_statusMutex);
+  return stat;
+}
+
+void WiFiManager::setPendingCredentials(const String& ssid, const String& password) {
+  xSemaphoreTake(_pendingMutex, portMAX_DELAY);
+  _pendingSsid = ssid;
+  _pendingPassword = password;
+  _newCredentialsAvailable = true;
+  xSemaphoreGive(_pendingMutex);
+}
+
+bool WiFiManager::fetchPendingCredentials(String &ssid, String &password) {
+  bool newCred = false;
+  xSemaphoreTake(_pendingMutex, portMAX_DELAY);
+  if (_newCredentialsAvailable) {
+    ssid = _pendingSsid;
+    password = _pendingPassword;
+    _newCredentialsAvailable = false;
+    newCred = true;
+  }
+  xSemaphoreGive(_pendingMutex);
+  return newCred;
 }
 
 //==========================================================================
@@ -173,12 +251,7 @@ void WiFiManager::begin(bool runServerOnSeparateCore, int serverCore, int manage
 }
 
 WiFiStatus WiFiManager::getStatus() {
-  WiFiStatus currentStatus;
-  if (xSemaphoreTake(_statusMutex, portMAX_DELAY) == pdTRUE) {
-    currentStatus = _status;
-    xSemaphoreGive(_statusMutex);
-  }
-  return currentStatus;
+  return safeGetStatus();
 }
 
 void WiFiManager::processWebServer() {
@@ -205,6 +278,16 @@ bool WiFiManager::resetCredentials() {
 
 void WiFiManager::setConnectTimeout(unsigned long timeout) {
   _connectTimeout = timeout;
+}
+
+/**
+ * @brief Forces the device to start AP mode so that new credentials can be entered.
+ */
+void WiFiManager::forceAPMode() {
+  Serial.println("WiFiManager: Forcing AP mode for new credentials...");
+  stopAPMode();
+  startAPMode();
+  updateStatus(WiFiStatus::AP_MODE_ACTIVE);
 }
 
 //==========================================================================
@@ -273,14 +356,15 @@ bool WiFiManager::saveLastCredentials(const String &ssid, const String &password
 }
 
 //==========================================================================
-// WiFi Connection Helper
+// WiFi Connection Helpers
 //==========================================================================
-bool WiFiManager::tryConnect(const String &ssid, const String &password) {
+bool WiFiManager::tryConnectInternal(const String &ssid, const String &password) {
   if (xSemaphoreTake(_connectionMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
     Serial.println("WiFiManager: Connection attempt already in progress.");
     return false;
   }
 
+  // Set WiFi to station mode and disconnect any current connection.
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
@@ -302,10 +386,27 @@ bool WiFiManager::tryConnect(const String &ssid, const String &password) {
     Serial.printf("WiFiManager: Successfully connected to '%s'\n", ssid.c_str());
     saveLastCredentials(ssid, password);
   } else {
-    Serial.printf("WiFiManager: Connection attempt to '%s' failed\n", ssid.c_str());
+    // Removed WiFi.reasonCode() call since it does not exist in ESP32's WiFi library.
+    Serial.printf("[WM] Connection failed to %s (RSSI: %d)\n", ssid.c_str(), WiFi.RSSI());
   }
 
   xSemaphoreGive(_connectionMutex);
+  return connected;
+}
+
+bool WiFiManager::tryConnect(const String &ssid, const String &password) {
+  // Automatically update status to TRYING_TO_CONNECT
+  updateStatus(WiFiStatus::TRYING_TO_CONNECT);
+  bool connected = tryConnectInternal(ssid, password);
+  if (connected) {
+    while (!hasInternetAccess()) {
+      Serial.println("WiFiManager: Connected to WiFi but no internet access. waiting...");
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    updateStatus(WiFiStatus::CONNECTED);
+  } else {
+    updateStatus(WiFiStatus::DISCONNECTED);
+  }
   return connected;
 }
 
@@ -313,8 +414,10 @@ bool WiFiManager::tryConnect(const String &ssid, const String &password) {
 // AP Mode & Captive Portal Functions
 //==========================================================================
 void WiFiManager::setupCaptivePortal() {
+  // Start the DNS server to catch all DNS requests and redirect to the AP IP.
   _dnsServer.start(53, "*", WiFi.softAPIP());
 
+  // Handle redirection for common endpoints used by captive portals.
   _server->on("/generate_204", [this]() { handleRedirect(); });
   _server->on("/hotspot-detect.html", [this]() { handleRedirect(); });
   _server->on("/connecttest.txt", [this]() { handleRedirect(); });
@@ -346,12 +449,16 @@ bool WiFiManager::isIp(const String& str) {
 void WiFiManager::startAPMode() {
   // If already in AP mode with an active web server, do nothing.
   if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
-    if (_server) return;
+    if (_server) {
+      Serial.println("WiFiManager: AP mode already active.");
+      return;
+    }
   }
 
   Serial.println("WiFiManager: Starting AP mode for WiFi setup...");
-
-  // Use AP+STA mode so that scanning is allowed.
+  WiFi.disconnect(true);
+  delay(100);
+  // Use AP+STA mode so that WiFi scanning is allowed.
   WiFi.mode(WIFI_AP_STA);
   if (_apPassword.length() >= 8) {
     WiFi.softAP(_apSsid.c_str(), _apPassword.c_str());
@@ -378,6 +485,26 @@ void WiFiManager::startAPMode() {
 
   // Endpoint to return cached WiFi networks as JSON.
   _server->on("/wifinetworks", [this]() { handleWifiNetworks(); });
+
+  // Modified status endpoint handler with lambda capturing 'this'
+  _server->on(STATUS_ENDPOINT, [this]() {
+    static constexpr char jsonTemplate[] = R"({"status":"%s"})";
+    char response[sizeof(jsonTemplate) + 20];
+    
+    const char* statusStr = [this]() -> const char* {
+      switch(safeGetStatus()) {
+        case WiFiStatus::INITIALIZING: return "INITIALIZING";
+        case WiFiStatus::TRYING_TO_CONNECT: return "TRYING_TO_CONNECT";
+        case WiFiStatus::AP_MODE_ACTIVE: return "AP_MODE_ACTIVE";
+        case WiFiStatus::CONNECTED: return "CONNECTED";
+        case WiFiStatus::DISCONNECTED: return "DISCONNECTED";
+        default: return "UNKNOWN";
+      }
+    }();
+    
+    snprintf_P(response, sizeof(response), jsonTemplate, statusStr);
+    _server->send(200, "application/json", response);
+  });
 
   // Endpoint for submitting WiFi credentials.
   _server->on("/submit", HTTP_POST, [this]() { handleSubmitCredentials(); });
@@ -447,24 +574,17 @@ void WiFiManager::stopAPMode() {
 // Web Server HTTP Handlers
 //==========================================================================
 void WiFiManager::handleSubmitCredentials() {
-  if (!_server->hasArg("ssid") || _server->arg("ssid") == "") {
-    _server->send(400, "text/plain", "SSID is required.");
+  if (!_server->hasArg("ssid") || _server->arg("ssid").isEmpty()) {
+    _server->send(400, "text/plain", F("SSID is required"));
     return;
   }
-  String ssid = _server->arg("ssid");
-  String password = _server->arg("password");
 
-  if (xSemaphoreTake(_pendingMutex, portMAX_DELAY) == pdTRUE) {
-    _pendingSsid = ssid;
-    _pendingPassword = password;
-    _newCredentialsAvailable = true;
-    xSemaphoreGive(_pendingMutex);
-  }
+  setPendingCredentials(_server->arg("ssid"), _server->arg("password"));
 
-  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Connecting</title></head><body>";
-  html += "<h1>Attempting to connect...</h1>";
-  html += "<p>Please wait while the connection is attempted.</p>";
-  html += "</body></html>";
+  char html[sizeof(connectingHtml) + 64]; // Calculate proper size
+  snprintf_P(html, sizeof(html), connectingHtml,
+            _server->arg("ssid").c_str(), _connectTimeout / 1000);
+  
   _server->send(200, "text/html", html);
 }
 
@@ -488,18 +608,12 @@ void WiFiManager::handleWifiNetworks() {
 void WiFiManager::managerTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   String storedSsid, storedPassword;
+  String newSsid, newPassword;
+  unsigned long lastAttemptTime = millis();
 
   // Try to load stored credentials.
   if (manager->loadLastCredentials(storedSsid, storedPassword)) {
-    if (xSemaphoreTake(manager->_statusMutex, portMAX_DELAY) == pdTRUE) {
-      manager->_status = WiFiStatus::TRYING_TO_CONNECT;
-      xSemaphoreGive(manager->_statusMutex);
-    }
     if (manager->tryConnect(storedSsid, storedPassword)) {
-      if (xSemaphoreTake(manager->_statusMutex, portMAX_DELAY) == pdTRUE) {
-        manager->_status = WiFiStatus::CONNECTED;
-        xSemaphoreGive(manager->_statusMutex);
-      }
       Serial.println("WiFiManager: Connected using stored credentials.");
       manager->stopAPMode();
       vTaskDelete(NULL);
@@ -511,55 +625,39 @@ void WiFiManager::managerTask(void* param) {
     Serial.println("WiFiManager: No stored credentials found.");
   }
 
-  // Instead of calling startAPMode() directly, call ensureAPModeActive()
-  // so that the status is updated to AP_MODE_ACTIVE.
+  // Ensure AP mode is active and update status.
   manager->ensureAPModeActive();
 
-  // Main loop: poll for new credentials.
+  // Main loop: poll for new credentials and monitor connection status.
   while (true) {
     if (WiFi.status() == WL_CONNECTED) {
-      if (xSemaphoreTake(manager->_statusMutex, portMAX_DELAY) == pdTRUE) {
-        manager->_status = WiFiStatus::CONNECTED;
-        xSemaphoreGive(manager->_statusMutex);
-      }
+      manager->updateStatus(WiFiStatus::CONNECTED);
       Serial.println("WiFiManager: WiFi connection established.");
       manager->stopAPMode();
       break;
     }
-
-    // Check for new credentials in a thread-safe way.
-    bool newCreds = false;
-    String newSsid, newPassword;
-    if (xSemaphoreTake(manager->_pendingMutex, portMAX_DELAY) == pdTRUE) {
-      if (manager->_newCredentialsAvailable) {
-        newCreds = true;
-        newSsid = manager->_pendingSsid;
-        newPassword = manager->_pendingPassword;
-        manager->_newCredentialsAvailable = false;
-      }
-      xSemaphoreGive(manager->_pendingMutex);
-    }
-
-    if (newCreds) {
-      // Ensure AP mode is active.
-      manager->ensureAPModeActive();
-      if (xSemaphoreTake(manager->_statusMutex, portMAX_DELAY) == pdTRUE) {
-        manager->_status = WiFiStatus::TRYING_TO_CONNECT;
-        xSemaphoreGive(manager->_statusMutex);
-      }
+    // Check for new credentials.
+    if (manager->fetchPendingCredentials(newSsid, newPassword)) {
+      lastAttemptTime = millis(); // Reset timer on new attempt.
+      manager->updateStatus(WiFiStatus::TRYING_TO_CONNECT);
       Serial.printf("WiFiManager: Attempting connection with new credentials: '%s'\n", newSsid.c_str());
       if (manager->tryConnect(newSsid, newPassword)) {
-        if (xSemaphoreTake(manager->_statusMutex, portMAX_DELAY) == pdTRUE) {
-          manager->_status = WiFiStatus::CONNECTED;
-          xSemaphoreGive(manager->_statusMutex);
-        }
         Serial.println("WiFiManager: Connected using new credentials.");
-        manager->stopAPMode();
+        manager->updateStatus(WiFiStatus::CONNECTED);
         break;
       } else {
         Serial.println("WiFiManager: New credentials failed; remaining in AP mode.");
+        manager->updateStatus(WiFiStatus::DISCONNECTED);
         manager->ensureAPModeActive();
       }
+    }
+    
+    // Handle status timeout
+    if (manager->safeGetStatus() == WiFiStatus::TRYING_TO_CONNECT &&
+        millis() - lastAttemptTime > manager->_connectTimeout) {
+      manager->updateStatus(WiFiStatus::DISCONNECTED);
+      Serial.println("WiFiManager: Connection attempt timed out. Switching to AP mode.");
+      manager->ensureAPModeActive();
     }
 
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -582,12 +680,15 @@ void WiFiManager::serverTask(void* param) {
 void WiFiManager::monitorTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
-    if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED) {
+    // Check if WiFi is in station mode but not connected.
+    if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED &&
+        manager->safeGetStatus() != WiFiStatus::TRYING_TO_CONNECT) {
       Serial.println("WiFiManager: Detected WiFi disconnection. Attempting automatic reconnection...");
+      manager->updateStatus(WiFiStatus::DISCONNECTED);
       String storedSsid, storedPassword;
       if (manager->loadLastCredentials(storedSsid, storedPassword)) {
         bool reconnected = false;
-        for (int attempt = 0; attempt < 3 && !reconnected; attempt++) {
+        for (int attempt = 0; attempt < 1 && !reconnected; attempt++) {
           Serial.printf("WiFiManager: Reconnection attempt %d...\n", attempt + 1);
           reconnected = manager->tryConnect(storedSsid, storedPassword);
           if (!reconnected) {
@@ -596,14 +697,21 @@ void WiFiManager::monitorTask(void* param) {
         }
         if (!reconnected) {
           Serial.println("WiFiManager: Automatic reconnection failed, switching to AP mode");
-          if (WiFi.getMode() != WIFI_AP_STA) manager->startAPMode();
+          manager->ensureAPModeActive();
         } else {
           Serial.println("WiFiManager: Reconnected successfully");
         }
       } else {
         Serial.println("WiFiManager: No stored credentials available for reconnection. Switching to AP mode.");
-        if (WiFi.getMode() != WIFI_AP_STA) manager->startAPMode();
+        manager->ensureAPModeActive();
       }
+    } else if (manager->safeGetStatus() == WiFiStatus::CONNECTED && !manager->hasInternetAccess()) {
+      manager->updateStatus(WiFiStatus::NO_INTERNET);
+    }
+
+    if (manager->safeGetStatus() == WiFiStatus::NO_INTERNET && manager->hasInternetAccess()) {
+      Serial.println("WiFiManager: Internet access restored.");
+      manager->updateStatus(WiFiStatus::CONNECTED);
     }
     vTaskDelay(pdMS_TO_TICKS(5000));
   }
@@ -633,16 +741,43 @@ void WiFiManager::scanTask(void* param) {
   }
 }
 
+bool WiFiManager::hasInternetAccess() {
+  // First, ensure we are connected to WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(3000); // Set a 3-second timeout
+  http.begin("http://clients3.google.com/generate_204");
+  int httpCode = http.GET();
+  http.end();
+
+  // Expecting a 204 No Content response indicates that internet access is available.
+  return (httpCode == 204);
+}
+
 //==========================================================================
 // Helper: Ensure AP Mode is Active
 //==========================================================================
 void WiFiManager::ensureAPModeActive() {
-  if (WiFi.getMode() == WIFI_AP_STA && _server != nullptr) {
-    return;
+  if (safeGetStatus() != WiFiStatus::AP_MODE_ACTIVE || 
+     WiFi.getMode() != WIFI_AP_STA || !_server) {
+    startAPMode();
+    updateStatus(WiFiStatus::AP_MODE_ACTIVE);
   }
-  startAPMode();
-  if (xSemaphoreTake(_statusMutex, portMAX_DELAY) == pdTRUE) {
-    _status = WiFiStatus::AP_MODE_ACTIVE;
-    xSemaphoreGive(_statusMutex);
+}
+
+//==========================================================================
+// Private Helper for Converting WiFiStatus to String
+//==========================================================================
+const char* WiFiManager::wifiStatusToString(WiFiStatus status) {
+  switch(status) {
+    case WiFiStatus::INITIALIZING: return "INITIALIZING";
+    case WiFiStatus::TRYING_TO_CONNECT: return "TRYING_TO_CONNECT";
+    case WiFiStatus::AP_MODE_ACTIVE: return "AP_MODE_ACTIVE";
+    case WiFiStatus::CONNECTED: return "CONNECTED";
+    case WiFiStatus::DISCONNECTED: return "DISCONNECTED";
+    default: return "UNKNOWN";
   }
 }
