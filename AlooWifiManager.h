@@ -11,18 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-
-/*
- * WiFiManager – A WiFi connection and captive portal manager for the ESP32.
- *
- * This library supports external web files stored in SPIFFS.
- * To use external web files:
- * 1. Create a directory (for example, "web") in your project's data folder.
- * 2. Place your index.html, connect.html, style.css, and script.js files in that folder.
- * 3. When instantiating the WiFiManager, pass the directory name as the third parameter.
- * 4. Use the Arduino SPIFFS uploader (or PlatformIO equivalent) to upload the data.
- * If the files are not found, the library falls back to built-in default pages.
- */
+#include "freertos/timers.h"
 
 //========================================================================
 // WiFi Status Enumeration
@@ -32,7 +21,7 @@ enum class WiFiStatus {
   TRYING_TO_CONNECT,  // Actively trying to connect (stored or submitted credentials)
   AP_MODE_ACTIVE,     // AP mode active and captive portal available
   CONNECTED,          // Successfully connected to a WiFi network
-  DISCONNECTED,        // WiFi is disconnected
+  DISCONNECTED,       // WiFi is disconnected
   NO_INTERNET         // Connected to WiFi but no internet access
 };
 
@@ -50,13 +39,19 @@ struct WiFiNetwork {
 class WiFiManager {
 public:
   /**
-   * @brief Constructor with configurable AP credentials and web directory.
+   * @brief Constructor with configurable AP credentials, web directory, and optional parameters.
    * @param apSsid SSID for the configuration access point.
    * @param apPassword Password for the configuration AP (empty string for open network).
    * @param webDir Directory in SPIFFS where external web files are stored.
    *               If empty, default embedded web pages will be used.
+   * @param autoLaunchAP When true, automatically launch AP mode after a failed connection attempt.
+   * @param reconnectionAttempts Number of reconnection attempts before giving up.
    */
-  WiFiManager(const String& apSsid = "ESP32-Config", const String& apPassword = "", const String& webDir = "");
+  WiFiManager(const String& apSsid = "ESP32-Config", 
+              const String& apPassword = "", 
+              const String& webDir = "",
+              bool autoLaunchAP = true,
+              int reconnectionAttempts = 1);
   ~WiFiManager();
 
   /**
@@ -92,20 +87,26 @@ public:
    */
   void forceAPMode();
 
+  /**
+   * @brief Initiates a connection attempt in a non-blocking, event-based way.
+   * @param ssid The WiFi SSID.
+   * @param password The WiFi password.
+   * @return Always returns true (connection result is notified via events).
+   */
+  bool tryConnect(const String &ssid, const String &password);
+
 private:
   //========================================================================
-  // Private Members
+  // Private Members (Configuration, State, and Tasks)
   //========================================================================
-  // AP Configuration and Web Directory
   String _apSsid;
   String _apPassword;
-  String _webDir; // SPIFFS directory where external web files reside
+  String _webDir; // SPIFFS directory for external web files
 
-  // WiFi status and synchronization
   WiFiStatus _status;
   SemaphoreHandle_t _statusMutex;
 
-  // Credential management (for new credentials submitted via the captive portal)
+  // Credential management for pending credentials submitted via captive portal
   String _pendingSsid;
   String _pendingPassword;
   bool _newCredentialsAvailable;
@@ -116,92 +117,66 @@ private:
   DNSServer _dnsServer;
   bool _runServerOnSeparateCore;
 
-  // Task management handles
+  // Task handles
   TaskHandle_t _managerTaskHandle;
   TaskHandle_t _serverTaskHandle;
   TaskHandle_t _monitorTaskHandle;
-  TaskHandle_t _scanTaskHandle; // Task to update available WiFi networks periodically
+  TaskHandle_t _scanTaskHandle;
   int _serverCore;
   int _managerCore;
 
   // Persistent storage (using Preferences)
   Preferences _preferences;
-  static constexpr char PREF_NAMESPACE[] = "wifimanager";
-  static constexpr char PREF_SSID_KEY[] = "last_ssid";
-  static constexpr char PREF_PASS_KEY[] = "last_pass";
+  static const char PREF_NAMESPACE[];  // Defined in cpp
+  static const char PREF_SSID_KEY[];     // Defined in cpp
+  static const char PREF_PASS_KEY[];     // Defined in cpp
 
-  // Mutex to prevent simultaneous connection attempts
+  // Mutex to protect simultaneous connection attempts
   SemaphoreHandle_t _connectionMutex;
 
-  // Connection timeout for WiFi connection attempts (in milliseconds)
+  // Connection timeout (milliseconds)
   unsigned long _connectTimeout;
 
-  // Cached WiFi networks (for the /wifinetworks endpoint)
+  // Cached WiFi networks (for /wifinetworks endpoint)
   std::vector<WiFiNetwork> _cachedNetworks;
   SemaphoreHandle_t _networksMutex;
 
   //========================================================================
-  // New Private Constants for Status Polling and Endpoints
+  // Endpoints and Polling Constants
   //========================================================================
-  static constexpr unsigned long STATUS_POLL_INTERVAL_MS = 2000;
-  static inline constexpr char STATUS_ENDPOINT[] = "/status";
+  static const char STATUS_ENDPOINT[];   // Defined in cpp
   static constexpr char NETWORKS_ENDPOINT[] = "/wifinetworks";
   static constexpr char SUBMIT_ENDPOINT[] = "/submit";
 
   //========================================================================
-  // Private Helper Functions for Shared Variables
+  // Event-based Enhancements
   //========================================================================
-  /**
-   * @brief Updates the internal WiFi status in a thread-safe manner.
-   * @param newStatus The new WiFiStatus.
-   */
+  static WiFiManager* _instance;          // Singleton instance for event callbacks
+  TimerHandle_t _internetCheckTimer;        // Timer to periodically check internet access
+  bool _isConnecting;                       // Flag to indicate ongoing connection attempt
+  SemaphoreHandle_t _connectingMutex;       // Mutex to protect _isConnecting
+
+  // New optional parameters
+  bool _autoLaunchAP;                       // Whether to automatically launch AP after failed connection
+  int _reconnectionAttempts;                // Number of reconnection attempts before giving up
+
+  // New members to store current credentials for saving on successful connection
+  String _currentSsid;
+  String _currentPassword;
+
+  //========================================================================
+  // Private Helper Functions for Shared Variables and Operations
+  //========================================================================
   void updateStatus(WiFiStatus newStatus);
-
-  /**
-   * @brief Retrieves the current WiFi status in a thread-safe manner.
-   * @return The current WiFiStatus.
-   */
   WiFiStatus safeGetStatus();
-
-  /**
-   * @brief Sets new pending credentials (submitted via the captive portal) safely.
-   * @param ssid The new SSID.
-   * @param password The new password.
-   */
   void setPendingCredentials(const String& ssid, const String& password);
-
-  /**
-   * @brief Checks for and retrieves pending credentials if available.
-   * @param ssid (out) The pending SSID.
-   * @param password (out) The pending password.
-   * @return True if new credentials were available; otherwise false.
-   */
   bool fetchPendingCredentials(String &ssid, String &password);
 
   //========================================================================
   // SPIFFS and File Serving Helpers
   //========================================================================
-  /**
-   * @brief Loads a file from SPIFFS.
-   * @param filePath Full path to the file.
-   * @return Contents of the file as a String, or empty String if error.
-   */
   String loadFileFromSPIFFS(const String& filePath);
-
-  /**
-   * @brief Retrieves file content from SPIFFS if available; otherwise returns the default content.
-   * @param fileName Name of the file (relative to webDir).
-   * @param defaultContent Default content to use if file not found.
-   */
   String getFileContent(const String& fileName, const char* defaultContent);
-
-  /**
-   * @brief Sets up a static endpoint that serves a file with the specified content type.
-   * @param uri URI endpoint.
-   * @param fileName Name of the file to load from SPIFFS (relative to webDir).
-   * @param defaultContent Fallback content if the file is not found.
-   * @param contentType MIME type.
-   */
   void setupStaticEndpoint(const String& uri, const String& fileName, const char* defaultContent, const char* contentType);
 
   //========================================================================
@@ -211,31 +186,10 @@ private:
   bool saveLastCredentials(const String &ssid, const String &password);
 
   //========================================================================
-  // Connection Management Helpers
+  // AP Mode and Captive Portal Functions
   //========================================================================
-  /**
-   * @brief Internal function that attempts a connection to the given credentials.
-   * @param ssid The WiFi SSID.
-   * @param password The WiFi password.
-   * @return True if connected; otherwise false.
-   */
-  bool tryConnectInternal(const String &ssid, const String &password);
-
-  /**
-   * @brief Attempts to connect to the given WiFi credentials.
-   *        Automatically updates the status to TRYING_TO_CONNECT, CONNECTED, or DISCONNECTED.
-   * @param ssid The WiFi SSID.
-   * @param password The WiFi password.
-   * @return True if connected; otherwise false.
-   */
-  bool tryConnect(const String &ssid, const String &password);
-
   void startAPMode();
   void stopAPMode();
-
-  //========================================================================
-  // Captive Portal Functionality
-  //========================================================================
   void setupCaptivePortal();
   void handleRedirect();
   bool isIp(const String& str);
@@ -254,15 +208,17 @@ private:
   static void monitorTask(void* param);
   static void scanTask(void* param);
   bool hasInternetAccess();
-  /**
-   * @brief Ensures AP mode is active.
-   */
   void ensureAPModeActive();
 
   //========================================================================
   // Private Helper for Converting WiFiStatus to String
   //========================================================================
   const char* wifiStatusToString(WiFiStatus status);
+
+  //========================================================================
+  // Event-based WiFi Event Handler
+  //========================================================================
+  static void wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info);
 };
 
 #endif // ALOO_WIFI_MANAGER_H
