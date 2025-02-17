@@ -671,37 +671,39 @@ void WiFiManager::monitorTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
     // Check for disconnection and attempt automatic reconnection.
-    if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED &&
-        manager->safeGetStatus() != WiFiStatus::TRYING_TO_CONNECT) {
-      Serial.println("WiFiManager: Detected WiFi disconnection. Attempting automatic reconnection...");
-      manager->updateStatus(WiFiStatus::DISCONNECTED);
-      String storedSsid, storedPassword;
-      if (manager->loadLastCredentials(storedSsid, storedPassword)) {
-        bool reconnected = false;
-        for (int attempt = 0; attempt < manager->_reconnectionAttempts && !reconnected; attempt++) {
-          Serial.printf("WiFiManager: Reconnection attempt %d...\n", attempt + 1);
-          manager->tryConnect(storedSsid, storedPassword);
-          reconnected = manager->safeGetStatus() == WiFiStatus::CONNECTED;
-          if (!reconnected) {
-            vTaskDelay(pdMS_TO_TICKS(3000));
-          }
-        }
-        if (!reconnected) {
-          Serial.println("WiFiManager: Automatic reconnection failed.");
-          if (manager->_autoLaunchAP) {
-            Serial.println("WiFiManager: Switching to AP mode.");
-            manager->ensureAPModeActive();
-          }
-        } else {
-          Serial.println("WiFiManager: Reconnected successfully");
-        }
-      } else {
-        Serial.println("WiFiManager: No stored credentials available for reconnection. Switching to AP mode.");
-        if (manager->_autoLaunchAP) {
-          manager->ensureAPModeActive();
-        }
-      }
-    } else if (manager->safeGetStatus() == WiFiStatus::CONNECTED && !manager->hasInternetAccess()) {
+    // if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED &&
+    //     manager->safeGetStatus() != WiFiStatus::TRYING_TO_CONNECT) {
+    //   Serial.println("WiFiManager: Detected WiFi disconnection. Attempting automatic reconnection...");
+    //   manager->updateStatus(WiFiStatus::DISCONNECTED);
+    //   String storedSsid, storedPassword;
+    //   if (manager->loadLastCredentials(storedSsid, storedPassword)) {
+    //     bool reconnected = false;
+    //     for (int attempt = 0; attempt < manager->_reconnectionAttempts && !reconnected; attempt++) {
+    //       Serial.printf("WiFiManager: Reconnection attempt %d...\n", attempt + 1);
+    //       manager->tryConnect(storedSsid, storedPassword);
+    //       reconnected = manager->safeGetStatus() == WiFiStatus::CONNECTED;
+    //       if (!reconnected) {
+    //         vTaskDelay(pdMS_TO_TICKS(3000));
+    //       }
+    //     }
+    //     if (!reconnected) {
+    //       Serial.println("WiFiManager: Automatic reconnection failed.");
+    //       if (manager->_autoLaunchAP) {
+    //         Serial.println("WiFiManager: Switching to AP mode.");
+    //         manager->ensureAPModeActive();
+    //       }
+    //     } else {
+    //       Serial.println("WiFiManager: Reconnected successfully");
+    //     }
+    //   } else {
+    //     Serial.println("WiFiManager: No stored credentials available for reconnection. Switching to AP mode.");
+    //     if (manager->_autoLaunchAP) {
+    //       manager->ensureAPModeActive();
+    //     }
+    //   }
+    // } 
+    
+    if (manager->safeGetStatus() == WiFiStatus::CONNECTED && !manager->hasInternetAccess()) {
       manager->updateStatus(WiFiStatus::NO_INTERNET);
     }
     if (manager->safeGetStatus() == WiFiStatus::NO_INTERNET && manager->hasInternetAccess()) {
@@ -774,21 +776,30 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
 
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("WiFiManager Callback: Connected to %s\n", WiFi.SSID().c_str());
       _instance->updateStatus(WiFiStatus::CONNECTED);
       _instance->saveLastCredentials(_instance->_currentSsid, _instance->_currentPassword);
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
       uint8_t reason = info.wifi_sta_disconnected.reason;
-      _instance->updateStatus(WiFiStatus::DISCONNECTED);
+      Serial.printf("WiFiManager Callback: Disconnected from AP (reason %d)\n", reason);
+      
       if (reason == WIFI_REASON_AUTH_FAIL || reason == WIFI_REASON_AUTH_EXPIRE) {
+        Serial.println("WiFiManager Callback: Authentication failed. setting auto reconnect to false");
         WiFi.setAutoReconnect(false);
-        _instance->forceAPMode();
       }
+      if (_instance->_autoLaunchAP) {
+        Serial.println("WiFiManager: Switching to AP mode.");
+        _instance->ensureAPModeActive();
+        break;
+      }
+      _instance->updateStatus(WiFiStatus::DISCONNECTED);
       break;
     }
 
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("WiFiManager Callback: STA Connected");
       _instance->updateStatus(WiFiStatus::TRYING_TO_CONNECT);
       break;
 
