@@ -139,7 +139,7 @@ WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, bool au
     _newCredentialsAvailable(false),
     _server(nullptr),
     _runServerOnSeparateCore(false),
-    _managerTaskHandle(nullptr),
+    _connectionManagerTaskHandle(nullptr),
     _serverTaskHandle(nullptr),
     _monitorTaskHandle(nullptr),
     _scanTaskHandle(nullptr),
@@ -163,7 +163,7 @@ WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, bool au
 }
 
 WiFiManager::~WiFiManager() {
-  if (_managerTaskHandle) vTaskDelete(_managerTaskHandle);
+  if (_connectionManagerTaskHandle) vTaskDelete(_connectionManagerTaskHandle);
   if (_serverTaskHandle) vTaskDelete(_serverTaskHandle);
   if (_monitorTaskHandle) vTaskDelete(_monitorTaskHandle);
   if (_scanTaskHandle) vTaskDelete(_scanTaskHandle);
@@ -247,22 +247,22 @@ void WiFiManager::begin(bool runServerOnSeparateCore, int serverCore, int manage
 
   Serial.println("WiFiManager: Starting asynchronous initialization...");
 
-  // Create the manager task.
+  // Create the persistent connection manager task.
   BaseType_t result = xTaskCreatePinnedToCore(
-    managerTask,
-    "WiFiManagerTask",
+    connectionManagerTask,
+    "WiFiConnMgrTask",
     8192,
     this,
     1,
-    &_managerTaskHandle,
+    &_connectionManagerTaskHandle,
     _managerCore
   );
   if (result != pdPASS) {
-    Serial.println("WiFiManager: Failed to create manager task.");
-    _managerTaskHandle = nullptr;
+    Serial.println("WiFiManager: Failed to create connection manager task.");
+    _connectionManagerTaskHandle = nullptr;
   }
 
-  // Create the monitor task for automatic reconnection.
+  // Create the monitor task for checking connectivity.
   result = xTaskCreatePinnedToCore(
     monitorTask,
     "WiFiMonitorTask",
@@ -586,61 +586,63 @@ void WiFiManager::handleWifiNetworks() {
 // Task Functions
 //--------------------------------------------------------------------------
 
-void WiFiManager::managerTask(void* param) {
+/**
+ * @brief Persistent connection manager task.
+ *
+ * This task continuously monitors the connection status. If not connected, it first checks
+ * for pending credentials (submitted via the captive portal) and tries to connect with them.
+ * If none are pending, it attempts to use stored credentials (only once per disconnection).
+ * If the connection attempt fails (within the timeout), it forces AP mode.
+ */
+void WiFiManager::connectionManagerTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
-  String storedSsid, storedPassword, newSsid, newPassword;
-
-  // Try stored credentials first.
-  if (manager->loadLastCredentials(storedSsid, storedPassword)) {
-    manager->tryConnect(storedSsid, storedPassword);
-    uint32_t startTime = xTaskGetTickCount();
-    bool connected = false;
-    while (xTaskGetTickCount() - startTime < pdMS_TO_TICKS(manager->_connectTimeout)) {
-      if (manager->safeGetStatus() == WiFiStatus::CONNECTED) {
-        connected = true;
-        break;
-      }
-      vTaskDelay(pdMS_TO_TICKS(100));
+  bool attemptedStored = false;
+  for (;;) {
+    if (manager->safeGetStatus() == WiFiStatus::CONNECTED or manager->safeGetStatus() == WiFiStatus::NO_INTERNET) {
+      // Reset flag so that stored credentials can be retried if connection is lost.
+      attemptedStored = false;
+      vTaskDelay(pdMS_TO_TICKS(manager->_managerTaskDelay));
+      continue;
     }
-    if (connected) {
-      Serial.println("WiFiManager: Connected using stored credentials.");
-      manager->stopAPMode();
-      vTaskDelete(NULL);
-      return;
-    } else {
-      Serial.println("WiFiManager: Stored credentials failed within timeout.");
-    }
-  } else {
-    Serial.println("WiFiManager: No stored credentials found.");
-  }
-
-  // Activate AP mode for new credentials.
-  manager->ensureAPModeActive();
-
-  while (true) {
+    // If pending credentials are available, try them.
+    String newSsid, newPassword;
     if (manager->fetchPendingCredentials(newSsid, newPassword)) {
+      Serial.println("WiFiManager: Attempting connection with pending credentials.");
       manager->tryConnect(newSsid, newPassword);
       uint32_t startTime = xTaskGetTickCount();
-      bool connected = false;
       while (xTaskGetTickCount() - startTime < pdMS_TO_TICKS(manager->_connectTimeout)) {
-        if (manager->safeGetStatus() == WiFiStatus::CONNECTED) {
-          connected = true;
-          break;
-        }
+        if (manager->safeGetStatus() == WiFiStatus::CONNECTED) break;
         vTaskDelay(pdMS_TO_TICKS(100));
       }
-      if (connected) {
-        Serial.println("WiFiManager: Connected using new credentials.");
-        manager->stopAPMode();
-        break;
+      if (manager->safeGetStatus() != WiFiStatus::CONNECTED) {
+        Serial.println("WiFiManager: Pending credentials connection attempt failed.");
+        manager->ensureAPModeActive();
+      }
+      // Continue to next loop iteration.
+    }
+    // No pending credentials available; try stored credentials (only once per disconnection).
+    else if (!attemptedStored) {
+      String storedSsid, storedPassword;
+      if (manager->loadLastCredentials(storedSsid, storedPassword)) {
+        Serial.println("WiFiManager: Attempting connection with stored credentials.");
+        manager->tryConnect(storedSsid, storedPassword);
+        uint32_t startTime = xTaskGetTickCount();
+        while (xTaskGetTickCount() - startTime < pdMS_TO_TICKS(manager->_connectTimeout)) {
+          if (manager->safeGetStatus() == WiFiStatus::CONNECTED) break;
+          vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (manager->safeGetStatus() != WiFiStatus::CONNECTED) {
+          Serial.println("WiFiManager: Stored credentials connection attempt failed, activating AP mode.");
+          manager->ensureAPModeActive();
+        }
+        attemptedStored = true;
       } else {
-        Serial.println("WiFiManager: New credentials failed within timeout.");
+        // No stored credentials available, ensure AP mode is active.
         manager->ensureAPModeActive();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(manager->_managerTaskDelay));
   }
-  vTaskDelete(NULL);
 }
 
 void WiFiManager::serverTask(void* param) {
@@ -658,15 +660,7 @@ void WiFiManager::monitorTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
     Serial.printf("WiFiManager monitorTask: Current status: %s\n", manager->wifiStatusToString(manager->safeGetStatus()));
-    if (manager->safeGetStatus() == WiFiStatus::AP_MODE_ACTIVE) {
-      if (WiFi.getMode() != WIFI_AP_STA) {
-        Serial.println("FATAL WiFiManager: AP mode is active but not in AP+STA mode.");
-      }
-      String storedSsid, storedPassword;
-      if (_instance->loadLastCredentials(storedSsid, storedPassword)) {
-        _instance->tryConnect(storedSsid, storedPassword);
-      }
-    }
+    // Only monitor internet connectivity here.
     if (manager->safeGetStatus() == WiFiStatus::CONNECTED && !manager->hasInternetAccess()) {
       manager->updateStatus(WiFiStatus::NO_INTERNET);
     }

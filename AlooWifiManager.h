@@ -16,7 +16,7 @@
 // WiFi Status Enumeration
 //========================================================================
 enum class WiFiStatus {
-  INITIALIZING,       // Manager task just started
+  INITIALIZING,       // Connection manager just started
   TRYING_TO_CONNECT,  // Actively trying to connect (stored or submitted credentials)
   AP_MODE_ACTIVE,     // AP mode active and captive portal available
   CONNECTED,          // Successfully connected to a WiFi network
@@ -55,8 +55,8 @@ public:
    *
    * @param runServerOnSeparateCore Run web server in a separate FreeRTOS task.
    * @param serverCore CPU core for web server task.
-   * @param managerCore CPU core for manager and monitor tasks.
-   * @param managerTaskDelay Delay (in ms) between iterations in the manager task loop.
+   * @param managerCore CPU core for connection manager and monitor tasks.
+   * @param managerTaskDelay Delay (in ms) between iterations in the connection manager task loop.
    * @param serverTaskDelay Delay (in ms) between iterations in the server task loop.
    * @param monitorTaskDelay Delay (in ms) between iterations in the monitor task loop.
    * @param scanTaskDelay Delay (in ms) between iterations in the scan task loop.
@@ -120,7 +120,7 @@ private:
   bool _runServerOnSeparateCore;
 
   // Task handles and core assignments
-  TaskHandle_t _managerTaskHandle;
+  TaskHandle_t _connectionManagerTaskHandle;  // Persistent connection manager task
   TaskHandle_t _serverTaskHandle;
   TaskHandle_t _monitorTaskHandle;
   TaskHandle_t _scanTaskHandle;
@@ -211,7 +211,7 @@ private:
   //========================================================================
   // Task Functions
   //========================================================================
-  static void managerTask(void* param);
+  static void connectionManagerTask(void* param);
   static void serverTask(void* param);
   static void monitorTask(void* param);
   static void scanTask(void* param);
