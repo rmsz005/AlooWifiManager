@@ -112,7 +112,7 @@ static const char connectingHtml[] PROGMEM = R"raw(
         })
         .catch(() => setTimeout(checkStatus, 2000));
     }
-    document.addEventListener('DOMContentLoaded', () => setTimeout(checkStatus, 2000));
+    document.addEventListener('DOMContentLoaded', () => setTimeout(checkStatus, 4000));
   </script>
 </head>
 <body>
@@ -241,16 +241,6 @@ void WiFiManager::begin(bool runServerOnSeparateCore, int serverCore, int manage
 
   Serial.println("WiFiManager: Starting asynchronous initialization...");
 
-  // Create the internet check timer (period: 5 seconds).
-  _internetCheckTimer = xTimerCreate(
-    "NetCheck", pdMS_TO_TICKS(5000), pdTRUE, this,
-    [](TimerHandle_t xTimer) {
-      WiFiManager* mgr = static_cast<WiFiManager*>(pvTimerGetTimerID(xTimer));
-      if (mgr->safeGetStatus() == WiFiStatus::CONNECTED && !mgr->hasInternetAccess()) {
-        mgr->updateStatus(WiFiStatus::NO_INTERNET);
-      }
-    }
-  );
 
   // Create the manager task.
   BaseType_t result = xTaskCreatePinnedToCore(
@@ -317,16 +307,21 @@ void WiFiManager::forceAPMode() {
  */
 bool WiFiManager::tryConnect(const String &ssid, const String &password) {
   if (xSemaphoreTake(_connectingMutex, portMAX_DELAY) != pdTRUE) return false;
-  _isConnecting = true;
-  xSemaphoreGive(_connectingMutex);
+  // xSemaphoreGive(_connectingMutex);
   
   // Store the attempted credentials for saving later on successful connection.
   _currentSsid = ssid;
   _currentPassword = password;
 
   updateStatus(WiFiStatus::TRYING_TO_CONNECT);
-  WiFi.setAutoReconnect(true);
+  // WiFi.setAutoReconnect(true);
+  Serial.printf("WiFiManager: Attempting to connect to %s   %s\n", ssid.c_str(), password.c_str());
   WiFi.begin(ssid.c_str(), password.c_str());
+  
+  // freertos delay
+  vTaskDelay(100);
+  xSemaphoreGive(_connectingMutex);
+
   return true;
 }
 
@@ -542,22 +537,32 @@ void WiFiManager::startAPMode() {
 
 void WiFiManager::stopAPMode() {
   Serial.println("WiFiManager: Stopping AP mode");
+
+  // First, stop the server and scan tasks to prevent accessing resources during deletion.
+  if (_serverTaskHandle) {
+    Serial.printf("[DEBUG] Deleting server task: %p\n", _serverTaskHandle);
+    vTaskDelete(_serverTaskHandle);
+    _serverTaskHandle = nullptr;
+  }
+
+  if (_scanTaskHandle) {
+    Serial.printf("[DEBUG] Deleting scan task: %p\n", _scanTaskHandle);
+    vTaskDelete(_scanTaskHandle);
+    _scanTaskHandle = nullptr;
+  }
+
+  // Then stop the DNS server and delete the web server.
   _dnsServer.stop();
   if (_server) {
+    Serial.println("WiFiManager: Stopping web server");
     _server->stop();
     delete _server;
     _server = nullptr;
   }
+
+  // Disconnect AP if needed.
   if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
     WiFi.softAPdisconnect(true);
-  }
-  if (_serverTaskHandle) {
-    vTaskDelete(_serverTaskHandle);
-    _serverTaskHandle = nullptr;
-  }
-  if (_scanTaskHandle) {
-    vTaskDelete(_scanTaskHandle);
-    _scanTaskHandle = nullptr;
   }
 }
 
@@ -670,8 +675,19 @@ void WiFiManager::serverTask(void* param) {
 void WiFiManager::monitorTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
+    Serial.printf("WiFiManager monitorTask: Current status: %s\n", manager->wifiStatusToString(manager->safeGetStatus()));
+    if (manager->safeGetStatus() == WiFiStatus::AP_MODE_ACTIVE){
+      if (WiFi.getMode() != WIFI_AP_STA) {
+        Serial.println("FATAL WiFiManager: AP mode is active but not in AP+STA mode.");
+      }
+       String storedSsid, storedPassword;
+      if (_instance->loadLastCredentials(storedSsid, storedPassword)) {
+        bool reconnected = false;
+          _instance->tryConnect(storedSsid, storedPassword);
+      }
+    }
     // Check for disconnection and attempt automatic reconnection.
-    // if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED &&
+    // if ( WiFi.status() != WL_CONNECTED &&
     //     manager->safeGetStatus() != WiFiStatus::TRYING_TO_CONNECT) {
     //   Serial.println("WiFiManager: Detected WiFi disconnection. Attempting automatic reconnection...");
     //   manager->updateStatus(WiFiStatus::DISCONNECTED);
@@ -701,7 +717,9 @@ void WiFiManager::monitorTask(void* param) {
     //       manager->ensureAPModeActive();
     //     }
     //   }
-    // } 
+    // } else {
+    //   Serial.println("WiFiManager: No action required.");
+    // }
     
     if (manager->safeGetStatus() == WiFiStatus::CONNECTED && !manager->hasInternetAccess()) {
       manager->updateStatus(WiFiStatus::NO_INTERNET);
@@ -742,13 +760,13 @@ void WiFiManager::scanTask(void* param) {
 
 bool WiFiManager::hasInternetAccess() {
   if (WiFi.status() != WL_CONNECTED) return false;
-  HTTPClient http;
-  http.setConnectTimeout(3000);
-  http.begin("http://clients3.google.com/generate_204");
-  int httpCode = http.GET();
-  http.end();
-  return (httpCode == 204);
+
+  WiFiClient client;
+  bool connected = client.connect(IPAddress(1, 1, 1, 1), 80, 3000);
+  client.stop(); // Ensure the connection is closed
+  return connected;
 }
+
 
 void WiFiManager::ensureAPModeActive() {
   if (safeGetStatus() != WiFiStatus::AP_MODE_ACTIVE || WiFi.getMode() != WIFI_AP_STA || !_server) {
@@ -764,6 +782,7 @@ const char* WiFiManager::wifiStatusToString(WiFiStatus status) {
     case WiFiStatus::AP_MODE_ACTIVE: return "AP_MODE_ACTIVE";
     case WiFiStatus::CONNECTED: return "CONNECTED";
     case WiFiStatus::DISCONNECTED: return "DISCONNECTED";
+    case WiFiStatus::NO_INTERNET: return "NO_INTERNET";
     default: return "UNKNOWN";
   }
 }
@@ -776,34 +795,62 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
 
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf("WiFiManager Callback: Connected to %s\n", WiFi.SSID().c_str());
+      Serial.printf("WiFiManager Callback: Connected ARDUINO_EVENT_WIFI_STA_GOT_IP %s\n", WiFi.SSID().c_str());
       _instance->updateStatus(WiFiStatus::CONNECTED);
       _instance->saveLastCredentials(_instance->_currentSsid, _instance->_currentPassword);
+      _instance->stopAPMode();
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
       uint8_t reason = info.wifi_sta_disconnected.reason;
-      Serial.printf("WiFiManager Callback: Disconnected from AP (reason %d)\n", reason);
+      Serial.printf("WiFiManager Callback: Disconnected from STA (reason %d)\n", reason);
       
       if (reason == WIFI_REASON_AUTH_FAIL || reason == WIFI_REASON_AUTH_EXPIRE) {
         Serial.println("WiFiManager Callback: Authentication failed. setting auto reconnect to false");
         WiFi.setAutoReconnect(false);
       }
-      if (_instance->_autoLaunchAP) {
-        Serial.println("WiFiManager: Switching to AP mode.");
-        _instance->ensureAPModeActive();
-        break;
+      //  String storedSsid, storedPassword;
+      // if (_instance->loadLastCredentials(storedSsid, storedPassword)) {
+      //   bool reconnected = false;
+      //     _instance->tryConnect(storedSsid, storedPassword);
+      // }
+      // if (_instance->_autoLaunchAP) {
+      //   Serial.println("WiFiManager: Switching to AP mode.");
+      //   _instance->ensureAPModeActive();
+      //   break;
+      // }
+      if (_instance->safeGetStatus() != WiFiStatus::AP_MODE_ACTIVE) {
+        if (_instance->_autoLaunchAP) {
+          Serial.println("WiFiManager: Switching to AP mode.");
+          _instance->ensureAPModeActive();
+        } else {
+          _instance->updateStatus(WiFiStatus::DISCONNECTED);
+        }
       }
-      _instance->updateStatus(WiFiStatus::DISCONNECTED);
       break;
     }
 
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       Serial.println("WiFiManager Callback: STA Connected");
-      _instance->updateStatus(WiFiStatus::TRYING_TO_CONNECT);
+      // _instance->updateStatus(WiFiStatus::CONNECTED);
+      break;
+
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      Serial.println("WiFiManager Callback: AP STA Connected");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      Serial.println("WiFiManager Callback: AP STA Disconnected");
+      break;
+    case  ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+      Serial.println("WiFiManager Callback: AP STA IP Assigned");
+      break;
+    case ARDUINO_EVENT_WIFI_SCAN_DONE:
+      Serial.println("WiFiManager Callback: Scan Done");
       break;
 
     default:
       break;
   }
 }
+
+
