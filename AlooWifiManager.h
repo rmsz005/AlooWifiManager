@@ -56,11 +56,18 @@ public:
 
   /**
    * @brief Starts the asynchronous WiFi management and web server.
+   *
    * @param runServerOnSeparateCore Run web server in a separate FreeRTOS task.
    * @param serverCore CPU core for web server task.
    * @param managerCore CPU core for manager and monitor tasks.
+   * @param managerTaskDelay Delay (in ms) between iterations in the manager task loop.
+   * @param serverTaskDelay Delay (in ms) between iterations in the server task loop.
+   * @param monitorTaskDelay Delay (in ms) between iterations in the monitor task loop.
+   * @param scanTaskDelay Delay (in ms) between iterations in the scan task loop.
    */
-  void begin(bool runServerOnSeparateCore = true, int serverCore = 1, int managerCore = 1);
+  void begin(bool runServerOnSeparateCore = true, int serverCore = 1, int managerCore = 1,
+             uint32_t managerTaskDelay = 500, uint32_t serverTaskDelay = 10,
+             uint32_t monitorTaskDelay = 5000, uint32_t scanTaskDelay = 15000);
 
   /**
    * @brief Returns the current WiFi connection status.
@@ -117,7 +124,7 @@ private:
   DNSServer _dnsServer;
   bool _runServerOnSeparateCore;
 
-  // Task handles
+  // Task handles and core assignments
   TaskHandle_t _managerTaskHandle;
   TaskHandle_t _serverTaskHandle;
   TaskHandle_t _monitorTaskHandle;
@@ -163,6 +170,14 @@ private:
   // New members to store current credentials for saving on successful connection
   String _currentSsid;
   String _currentPassword;
+
+  //========================================================================
+  // Task Frequency Parameters (in milliseconds)
+  //========================================================================
+  uint32_t _managerTaskDelay;
+  uint32_t _serverTaskDelay;
+  uint32_t _monitorTaskDelay;
+  uint32_t _scanTaskDelay;
 
   //========================================================================
   // Private Helper Functions for Shared Variables and Operations
