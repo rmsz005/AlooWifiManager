@@ -136,6 +136,9 @@ private:
   // Mutex to protect simultaneous connection attempts
   SemaphoreHandle_t _connectionMutex;
 
+  // Mutex for WiFi operations (new addition)
+  SemaphoreHandle_t _wifiMutex;
+
   // Connection timeout (milliseconds)
   unsigned long _connectTimeout;
 
@@ -181,7 +184,7 @@ private:
   WiFiStatus safeGetStatus();
   void setPendingCredentials(const String& ssid, const String& password);
   bool fetchPendingCredentials(String &ssid, String &password);
-
+  bool resetWiFi();
   //========================================================================
   // Web Server Helpers (Default Embedded Web Files)
   //========================================================================

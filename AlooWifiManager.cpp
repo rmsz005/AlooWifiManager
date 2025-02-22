@@ -1,7 +1,11 @@
 #include "AlooWifiManager.h"
 #include <DNSServer.h>
 #include <HTTPClient.h>
-
+#ifdef ESP32
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
+#include <esp_netif.h>
+#endif
 //--------------------------------------------------------------------------
 // Default Embedded Web Files (Fallbacks)
 //--------------------------------------------------------------------------
@@ -130,6 +134,7 @@ WiFiManager* WiFiManager::_instance = nullptr;
 //--------------------------------------------------------------------------
 // Constructor & Destructor
 //--------------------------------------------------------------------------
+
 WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, bool autoLaunchAP, int reconnectionAttempts)
   : _apSsid(apSsid),
     _apPassword(apPassword),
@@ -156,6 +161,8 @@ WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, bool au
   _connectionMutex = xSemaphoreCreateMutex();
   _networksMutex   = xSemaphoreCreateMutex();
   _connectingMutex = xSemaphoreCreateMutex();
+  // Create new mutex for WiFi operations
+  _wifiMutex = xSemaphoreCreateMutex();
 
   // Set the singleton instance and register the WiFi event handler.
   _instance = this;
@@ -173,6 +180,8 @@ WiFiManager::~WiFiManager() {
   if (_connectionMutex) vSemaphoreDelete(_connectionMutex);
   if (_connectingMutex) vSemaphoreDelete(_connectingMutex);
   if (_networksMutex)  vSemaphoreDelete(_networksMutex);
+  // Delete WiFi mutex
+  if (_wifiMutex) vSemaphoreDelete(_wifiMutex);
   stopAPMode();
   if (_instance == this) _instance = nullptr;
 }
@@ -317,13 +326,51 @@ bool WiFiManager::tryConnect(const String &ssid, const String &password) {
   _currentPassword = password;
 
   updateStatus(WiFiStatus::TRYING_TO_CONNECT);
-  Serial.printf("WiFiManager: Attempting to connect to %s   %s\n", ssid.c_str(), password.c_str());
+  Serial.printf("WiFiManager: Attempting to connect to %s\n", ssid.c_str());
+  
+  // Use WiFi mutex to ensure exclusive access during connection attempts.
+  xSemaphoreTake(_wifiMutex, portMAX_DELAY);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid.c_str(), password.c_str());
+  xSemaphoreGive(_wifiMutex);
   
   // Brief delay to allow the connection attempt to start.
   vTaskDelay(pdMS_TO_TICKS(100));
   xSemaphoreGive(_connectingMutex);
   return true;
+}
+bool WiFiManager::resetWiFi() {
+    xSemaphoreTake(_wifiMutex, portMAX_DELAY);
+    
+    Serial.println("WiFiManager: Performing full WiFi reset...");
+    
+    // Force disconnect and disable interfaces
+    WiFi.disconnect(true, true);  // Disconnect + disable STA
+    WiFi.enableAP(false);
+    delay(100);
+    
+    // Clear persistent settings
+    WiFi.persistent(false);
+    WiFi.setAutoConnect(false);
+    WiFi.setAutoReconnect(false);
+    
+    // ESP-IDF level cleanup
+    esp_wifi_deinit();
+    esp_wifi_stop();
+    delay(100);
+    
+    // Reinitialize WiFi with default config
+    WiFi.mode(WIFI_MODE_NULL);
+    
+    // Create and initialize default config
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    
+    xSemaphoreGive(_wifiMutex);
+    
+    Serial.println("WiFiManager: WiFi stack fully reset");
+    return true;
 }
 
 //--------------------------------------------------------------------------
@@ -589,55 +636,63 @@ void WiFiManager::handleWifiNetworks() {
 /**
  * @brief Persistent connection manager task.
  *
- * This task continuously monitors the connection status. If not connected, it first checks
- * for pending credentials (submitted via the captive portal) and tries to connect with them.
- * If none are pending, it attempts to use stored credentials (only once per disconnection).
- * If the connection attempt fails (within the timeout), it forces AP mode.
+ * This task continuously monitors the connection status. If not connected
+ * (and not in a NO_INTERNET state), it checks for pending credentials first,
+ * then attempts stored credentials (only once per disconnection). The actual
+ * connection attempt is done via a helper lambda that calls tryConnect() and
+ * waits (non-blocking) for a notification from the WiFi event callback.
  */
 void WiFiManager::connectionManagerTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   bool attemptedStored = false;
+  static const int MAX_RETRIES = 5;
+  // Helper lambda for attempting a connection.
+  auto attemptConnection = [manager](const String &ssid, const String &password, const char* type) -> bool {
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      Serial.printf("WiFiManager: Attempt %d to connect with %s credentials: %s\n", attempt + 1, type, ssid.c_str());
+      // Ensure autoReconnect is enabled.
+      WiFi.disconnect(false, false);
+      manager->tryConnect(ssid, password);
+      xTaskNotifyStateClear(NULL);
+      if (xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(manager->_connectTimeout)) == pdTRUE) {
+        if (manager->safeGetStatus() == WiFiStatus::CONNECTED)
+          return true;
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      Serial.printf("WiFiManager: Attempt %d failed.\n", attempt + 1);
+    }
+    return false;
+  };
+
+  manager->resetWiFi();
+
   for (;;) {
-    if (manager->safeGetStatus() == WiFiStatus::CONNECTED or manager->safeGetStatus() == WiFiStatus::NO_INTERNET) {
-      // Reset flag so that stored credentials can be retried if connection is lost.
+    // If already connected (or in NO_INTERNET state), reset flag.
+    if (manager->safeGetStatus() == WiFiStatus::CONNECTED ||
+        manager->safeGetStatus() == WiFiStatus::NO_INTERNET) {
       attemptedStored = false;
       vTaskDelay(pdMS_TO_TICKS(manager->_managerTaskDelay));
       continue;
     }
-    // If pending credentials are available, try them.
+    // Try pending credentials first.
     String newSsid, newPassword;
     if (manager->fetchPendingCredentials(newSsid, newPassword)) {
-      Serial.println("WiFiManager: Attempting connection with pending credentials.");
-      manager->tryConnect(newSsid, newPassword);
-      uint32_t startTime = xTaskGetTickCount();
-      while (xTaskGetTickCount() - startTime < pdMS_TO_TICKS(manager->_connectTimeout)) {
-        if (manager->safeGetStatus() == WiFiStatus::CONNECTED) break;
-        vTaskDelay(pdMS_TO_TICKS(100));
-      }
-      if (manager->safeGetStatus() != WiFiStatus::CONNECTED) {
-        Serial.println("WiFiManager: Pending credentials connection attempt failed.");
+      if (!attemptConnection(newSsid, newPassword, "pending")) {
+        Serial.println("WiFiManager: Pending credentials connection failed.");
         manager->ensureAPModeActive();
       }
-      // Continue to next loop iteration.
     }
-    // No pending credentials available; try stored credentials (only once per disconnection).
+    // Otherwise, try stored credentials if not yet attempted.
     else if (!attemptedStored) {
       String storedSsid, storedPassword;
       if (manager->loadLastCredentials(storedSsid, storedPassword)) {
-        Serial.println("WiFiManager: Attempting connection with stored credentials.");
-        manager->tryConnect(storedSsid, storedPassword);
-        uint32_t startTime = xTaskGetTickCount();
-        while (xTaskGetTickCount() - startTime < pdMS_TO_TICKS(manager->_connectTimeout)) {
-          if (manager->safeGetStatus() == WiFiStatus::CONNECTED) break;
-          vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (manager->safeGetStatus() != WiFiStatus::CONNECTED) {
-          Serial.println("WiFiManager: Stored credentials connection attempt failed, activating AP mode.");
+        if (!attemptConnection(storedSsid, storedPassword, "stored")) {
+          Serial.println("WiFiManager: Stored credentials connection failed.");
           manager->ensureAPModeActive();
         }
         attemptedStored = true;
       } else {
-        // No stored credentials available, ensure AP mode is active.
+        // No stored credentials; force AP mode.
         manager->ensureAPModeActive();
       }
     }
@@ -660,7 +715,7 @@ void WiFiManager::monitorTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
     Serial.printf("WiFiManager monitorTask: Current status: %s\n", manager->wifiStatusToString(manager->safeGetStatus()));
-    // Only monitor internet connectivity here.
+    // Only monitor internet connectivity.
     if (manager->safeGetStatus() == WiFiStatus::CONNECTED && !manager->hasInternetAccess()) {
       manager->updateStatus(WiFiStatus::NO_INTERNET);
     }
@@ -675,12 +730,26 @@ void WiFiManager::monitorTask(void* param) {
 void WiFiManager::scanTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
+    // Use WiFi mutex to prevent concurrent operations.
+    xSemaphoreTake(manager->_wifiMutex, portMAX_DELAY);
+    Serial.println("[WM] Starting WiFi scan...");
     int ret = WiFi.scanNetworks(true);
-    while (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
-      vTaskDelay(pdMS_TO_TICKS(100));
+    if(ret == WIFI_SCAN_RUNNING) {
+      Serial.println("[WM] Scan initiated asynchronously.");
+    }
+    // Clear any previous notifications.
+    xTaskNotifyStateClear(NULL);
+    // Wait for scan completion notification from the WiFi event handler,
+    // with a timeout of 10 seconds.
+    BaseType_t notifyResult = xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(10000));
+    if (notifyResult == pdTRUE) {
+       Serial.println("[WM] Scan notification received.");
+    } else {
+       Serial.println("[WM] Scan notification timeout.");
     }
     int n = WiFi.scanComplete();
-    if (n >= 0) {
+    Serial.printf("[WM] WiFi scan complete, found %d networks.\n", n);
+    if(n >= 0) {
       std::vector<WiFiNetwork> tempNetworks;
       for (int i = 0; i < n; i++) {
         WiFiNetwork net;
@@ -688,12 +757,15 @@ void WiFiManager::scanTask(void* param) {
         net.rssi = WiFi.RSSI(i);
         tempNetworks.push_back(net);
       }
-      if (xSemaphoreTake(manager->_networksMutex, portMAX_DELAY) == pdTRUE) {
+      if(xSemaphoreTake(manager->_networksMutex, portMAX_DELAY) == pdTRUE) {
         manager->_cachedNetworks = tempNetworks;
         xSemaphoreGive(manager->_networksMutex);
       }
+    } else {
+      Serial.println("[WM] Scan failed or no networks found.");
     }
     WiFi.scanDelete();
+    xSemaphoreGive(manager->_wifiMutex);
     vTaskDelay(pdMS_TO_TICKS(manager->_scanTaskDelay));
   }
 }
@@ -734,10 +806,14 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
 
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf("WiFiManager Callback: Connected ARDUINO_EVENT_WIFI_STA_GOT_IP %s\n", WiFi.SSID().c_str());
+      Serial.printf("WiFiManager Callback: Got IP on SSID %s\n", WiFi.SSID().c_str());
       _instance->updateStatus(WiFiStatus::CONNECTED);
       _instance->saveLastCredentials(_instance->_currentSsid, _instance->_currentPassword);
       _instance->stopAPMode();
+      // Notify the connection manager of success.
+      if (_instance->_connectionManagerTaskHandle) {
+          xTaskNotifyGive(_instance->_connectionManagerTaskHandle);
+      }
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
@@ -745,7 +821,11 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
       Serial.printf("WiFiManager Callback: Disconnected from STA (reason %d)\n", reason);
       if (reason == WIFI_REASON_AUTH_FAIL || reason == WIFI_REASON_AUTH_EXPIRE) {
         Serial.println("WiFiManager Callback: Authentication failed. Disabling auto-reconnect.");
-        WiFi.setAutoReconnect(false);
+        // WiFi.setAutoReconnect(false);
+      }
+      // Notify the connection manager immediately so that waiting attempts wake up.
+      if (_instance->_connectionManagerTaskHandle) {
+          xTaskNotifyGive(_instance->_connectionManagerTaskHandle);
       }
       if (_instance->safeGetStatus() != WiFiStatus::AP_MODE_ACTIVE) {
         if (_instance->_autoLaunchAP) {
@@ -771,6 +851,10 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
       break;
     case ARDUINO_EVENT_WIFI_SCAN_DONE:
       Serial.println("WiFiManager Callback: Scan Done");
+      // Notify scan task that scan is complete.
+      if (_instance->_scanTaskHandle) {
+          xTaskNotifyGive(_instance->_scanTaskHandle);
+      }
       break;
     default:
       break;
