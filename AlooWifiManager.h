@@ -6,7 +6,6 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-#include <SPIFFS.h>
 #include <vector>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,17 +38,14 @@ struct WiFiNetwork {
 class WiFiManager {
 public:
   /**
-   * @brief Constructor with configurable AP credentials, web directory, and optional parameters.
+   * @brief Constructor with configurable AP credentials and optional parameters.
    * @param apSsid SSID for the configuration access point.
    * @param apPassword Password for the configuration AP (empty string for open network).
-   * @param webDir Directory in SPIFFS where external web files are stored.
-   *               If empty, default embedded web pages will be used.
    * @param autoLaunchAP When true, automatically launch AP mode after a failed connection attempt.
    * @param reconnectionAttempts Number of reconnection attempts before giving up.
    */
   WiFiManager(const String& apSsid = "ESP32-Config", 
               const String& apPassword = "", 
-              const String& webDir = "",
               bool autoLaunchAP = true,
               int reconnectionAttempts = 1);
   ~WiFiManager();
@@ -108,7 +104,6 @@ private:
   //========================================================================
   String _apSsid;
   String _apPassword;
-  String _webDir; // SPIFFS directory for external web files
 
   WiFiStatus _status;
   SemaphoreHandle_t _statusMutex;
@@ -188,11 +183,9 @@ private:
   bool fetchPendingCredentials(String &ssid, String &password);
 
   //========================================================================
-  // SPIFFS and File Serving Helpers
+  // Web Server Helpers (Default Embedded Web Files)
   //========================================================================
-  String loadFileFromSPIFFS(const String& filePath);
-  String getFileContent(const String& fileName, const char* defaultContent);
-  void setupStaticEndpoint(const String& uri, const String& fileName, const char* defaultContent, const char* contentType);
+  void setupDefaultEndpoints();
 
   //========================================================================
   // Credential Storage Helpers

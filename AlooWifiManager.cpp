@@ -2,15 +2,6 @@
 #include <DNSServer.h>
 #include <HTTPClient.h>
 
-// Provide out-of-line definitions for the static constant members
-const char WiFiManager::PREF_NAMESPACE[] = "wifimanager";
-const char WiFiManager::PREF_SSID_KEY[] = "last_ssid";
-const char WiFiManager::PREF_PASS_KEY[] = "last_pass";
-const char WiFiManager::STATUS_ENDPOINT[] = "/status";
-
-// Define the static instance pointer
-WiFiManager* WiFiManager::_instance = nullptr;
-
 //--------------------------------------------------------------------------
 // Default Embedded Web Files (Fallbacks)
 //--------------------------------------------------------------------------
@@ -124,13 +115,24 @@ static const char connectingHtml[] PROGMEM = R"raw(
 )raw";
 
 //--------------------------------------------------------------------------
+// Persistent Storage Keys
+//--------------------------------------------------------------------------
+const char WiFiManager::PREF_NAMESPACE[] = "wifimanager";
+const char WiFiManager::PREF_SSID_KEY[] = "last_ssid";
+const char WiFiManager::PREF_PASS_KEY[] = "last_pass";
+const char WiFiManager::STATUS_ENDPOINT[] = "/status";
+
+//--------------------------------------------------------------------------
+// Static Instance Pointer
+//--------------------------------------------------------------------------
+WiFiManager* WiFiManager::_instance = nullptr;
+
+//--------------------------------------------------------------------------
 // Constructor & Destructor
 //--------------------------------------------------------------------------
-WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, const String& webDir,
-                         bool autoLaunchAP, int reconnectionAttempts)
+WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, bool autoLaunchAP, int reconnectionAttempts)
   : _apSsid(apSsid),
     _apPassword(apPassword),
-    _webDir(webDir),
     _status(WiFiStatus::INITIALIZING),
     _pendingSsid(""),
     _pendingPassword(""),
@@ -243,13 +245,6 @@ void WiFiManager::begin(bool runServerOnSeparateCore, int serverCore, int manage
   _monitorTaskDelay = monitorTaskDelay;
   _scanTaskDelay = scanTaskDelay;
 
-  // Initialize SPIFFS if a web directory is specified.
-  if (!_webDir.isEmpty()) {
-    if (!SPIFFS.begin(true)) {
-      Serial.println("WiFiManager: SPIFFS Mount Failed");
-    }
-  }
-
   Serial.println("WiFiManager: Starting asynchronous initialization...");
 
   // Create the manager task.
@@ -332,37 +327,24 @@ bool WiFiManager::tryConnect(const String &ssid, const String &password) {
 }
 
 //--------------------------------------------------------------------------
-// SPIFFS and File Serving Helpers
+// Web Server Helpers (Default Embedded Web Files)
 //--------------------------------------------------------------------------
-
-String WiFiManager::loadFileFromSPIFFS(const String& filePath) {
-  File file = SPIFFS.open(filePath, "r");
-  if (!file || file.isDirectory()) {
-    Serial.printf("WiFiManager: Failed to open file: %s\n", filePath.c_str());
-    return "";
-  }
-  String content = file.readString();
-  file.close();
-  return content;
-}
-
-String WiFiManager::getFileContent(const String& fileName, const char* defaultContent) {
-  if (!_webDir.isEmpty()) {
-    String fullPath = _webDir + "/" + fileName;
-    String content = loadFileFromSPIFFS(fullPath);
-    if (!content.isEmpty()) {
-      return content;
-    } else {
-      Serial.printf("WiFiManager: File %s not found in SPIFFS, falling back to default.\n", fullPath.c_str());
-    }
-  }
-  return String(defaultContent);
-}
-
-void WiFiManager::setupStaticEndpoint(const String& uri, const String& fileName, const char* defaultContent, const char* contentType) {
-  _server->on(uri.c_str(), [this, fileName, defaultContent, contentType]() {
-    String content = getFileContent(fileName, defaultContent);
-    _server->send(200, contentType, content);
+void WiFiManager::setupDefaultEndpoints() {
+  // Setup endpoints to serve the default embedded HTML, CSS, and JS files.
+  _server->on("/", [this]() {
+    _server->send(200, "text/html", defaultIndexHtml);
+  });
+  _server->on("/index.html", [this]() {
+    _server->send(200, "text/html", defaultIndexHtml);
+  });
+  _server->on("/connect", [this]() {
+    _server->send(200, "text/html", defaultConnectHtml);
+  });
+  _server->on("/style.css", [this]() {
+    _server->send(200, "text/css", defaultStyleCss);
+  });
+  _server->on("/script.js", [this]() {
+    _server->send(200, "application/javascript", defaultScriptJs);
   });
 }
 
@@ -477,12 +459,8 @@ void WiFiManager::startAPMode() {
   }
   _server = new WebServer(80);
 
-  // Setup static endpoints for serving files.
-  setupStaticEndpoint("/", "index.html", defaultIndexHtml, "text/html");
-  setupStaticEndpoint("/index.html", "index.html", defaultIndexHtml, "text/html");
-  setupStaticEndpoint("/connect", "connect.html", defaultConnectHtml, "text/html");
-  setupStaticEndpoint("/style.css", "style.css", defaultStyleCss, "text/css");
-  setupStaticEndpoint("/script.js", "script.js", defaultScriptJs, "application/javascript");
+  // Setup default endpoints to serve embedded web files.
+  setupDefaultEndpoints();
 
   // Endpoint to return cached WiFi networks as JSON.
   _server->on("/wifinetworks", [this]() { handleWifiNetworks(); });
