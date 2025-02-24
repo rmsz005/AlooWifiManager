@@ -6,7 +6,6 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-#include <SPIFFS.h>
 #include <vector>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,7 +16,7 @@
 // WiFi Status Enumeration
 //========================================================================
 enum class WiFiStatus {
-  INITIALIZING,       // Manager task just started
+  INITIALIZING,       // Connection manager just started
   TRYING_TO_CONNECT,  // Actively trying to connect (stored or submitted credentials)
   AP_MODE_ACTIVE,     // AP mode active and captive portal available
   CONNECTED,          // Successfully connected to a WiFi network
@@ -39,17 +38,14 @@ struct WiFiNetwork {
 class WiFiManager {
 public:
   /**
-   * @brief Constructor with configurable AP credentials, web directory, and optional parameters.
+   * @brief Constructor with configurable AP credentials and optional parameters.
    * @param apSsid SSID for the configuration access point.
    * @param apPassword Password for the configuration AP (empty string for open network).
-   * @param webDir Directory in SPIFFS where external web files are stored.
-   *               If empty, default embedded web pages will be used.
    * @param autoLaunchAP When true, automatically launch AP mode after a failed connection attempt.
    * @param reconnectionAttempts Number of reconnection attempts before giving up.
    */
   WiFiManager(const String& apSsid = "ESP32-Config", 
               const String& apPassword = "", 
-              const String& webDir = "",
               bool autoLaunchAP = true,
               int reconnectionAttempts = 1);
   ~WiFiManager();
@@ -59,8 +55,8 @@ public:
    *
    * @param runServerOnSeparateCore Run web server in a separate FreeRTOS task.
    * @param serverCore CPU core for web server task.
-   * @param managerCore CPU core for manager and monitor tasks.
-   * @param managerTaskDelay Delay (in ms) between iterations in the manager task loop.
+   * @param managerCore CPU core for connection manager and monitor tasks.
+   * @param managerTaskDelay Delay (in ms) between iterations in the connection manager task loop.
    * @param serverTaskDelay Delay (in ms) between iterations in the server task loop.
    * @param monitorTaskDelay Delay (in ms) between iterations in the monitor task loop.
    * @param scanTaskDelay Delay (in ms) between iterations in the scan task loop.
@@ -108,7 +104,6 @@ private:
   //========================================================================
   String _apSsid;
   String _apPassword;
-  String _webDir; // SPIFFS directory for external web files
 
   WiFiStatus _status;
   SemaphoreHandle_t _statusMutex;
@@ -125,7 +120,7 @@ private:
   bool _runServerOnSeparateCore;
 
   // Task handles and core assignments
-  TaskHandle_t _managerTaskHandle;
+  TaskHandle_t _connectionManagerTaskHandle;  // Persistent connection manager task
   TaskHandle_t _serverTaskHandle;
   TaskHandle_t _monitorTaskHandle;
   TaskHandle_t _scanTaskHandle;
@@ -140,6 +135,9 @@ private:
 
   // Mutex to protect simultaneous connection attempts
   SemaphoreHandle_t _connectionMutex;
+
+  // Mutex for WiFi operations (new addition)
+  SemaphoreHandle_t _wifiMutex;
 
   // Connection timeout (milliseconds)
   unsigned long _connectTimeout;
@@ -186,13 +184,11 @@ private:
   WiFiStatus safeGetStatus();
   void setPendingCredentials(const String& ssid, const String& password);
   bool fetchPendingCredentials(String &ssid, String &password);
-
+  bool resetWiFi();
   //========================================================================
-  // SPIFFS and File Serving Helpers
+  // Web Server Helpers (Default Embedded Web Files)
   //========================================================================
-  String loadFileFromSPIFFS(const String& filePath);
-  String getFileContent(const String& fileName, const char* defaultContent);
-  void setupStaticEndpoint(const String& uri, const String& fileName, const char* defaultContent, const char* contentType);
+  void setupDefaultEndpoints();
 
   //========================================================================
   // Credential Storage Helpers
@@ -218,7 +214,7 @@ private:
   //========================================================================
   // Task Functions
   //========================================================================
-  static void managerTask(void* param);
+  static void connectionManagerTask(void* param);
   static void serverTask(void* param);
   static void monitorTask(void* param);
   static void scanTask(void* param);

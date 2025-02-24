@@ -1,16 +1,11 @@
 #include "AlooWifiManager.h"
 #include <DNSServer.h>
 #include <HTTPClient.h>
-
-// Provide out-of-line definitions for the static constant members
-const char WiFiManager::PREF_NAMESPACE[] = "wifimanager";
-const char WiFiManager::PREF_SSID_KEY[] = "last_ssid";
-const char WiFiManager::PREF_PASS_KEY[] = "last_pass";
-const char WiFiManager::STATUS_ENDPOINT[] = "/status";
-
-// Define the static instance pointer
-WiFiManager* WiFiManager::_instance = nullptr;
-
+#ifdef ESP32
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
+#include <esp_netif.h>
+#endif
 //--------------------------------------------------------------------------
 // Default Embedded Web Files (Fallbacks)
 //--------------------------------------------------------------------------
@@ -124,20 +119,32 @@ static const char connectingHtml[] PROGMEM = R"raw(
 )raw";
 
 //--------------------------------------------------------------------------
+// Persistent Storage Keys
+//--------------------------------------------------------------------------
+const char WiFiManager::PREF_NAMESPACE[] = "wifimanager";
+const char WiFiManager::PREF_SSID_KEY[] = "last_ssid";
+const char WiFiManager::PREF_PASS_KEY[] = "last_pass";
+const char WiFiManager::STATUS_ENDPOINT[] = "/status";
+
+//--------------------------------------------------------------------------
+// Static Instance Pointer
+//--------------------------------------------------------------------------
+WiFiManager* WiFiManager::_instance = nullptr;
+
+//--------------------------------------------------------------------------
 // Constructor & Destructor
 //--------------------------------------------------------------------------
-WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, const String& webDir,
-                         bool autoLaunchAP, int reconnectionAttempts)
+
+WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, bool autoLaunchAP, int reconnectionAttempts)
   : _apSsid(apSsid),
     _apPassword(apPassword),
-    _webDir(webDir),
     _status(WiFiStatus::INITIALIZING),
     _pendingSsid(""),
     _pendingPassword(""),
     _newCredentialsAvailable(false),
     _server(nullptr),
     _runServerOnSeparateCore(false),
-    _managerTaskHandle(nullptr),
+    _connectionManagerTaskHandle(nullptr),
     _serverTaskHandle(nullptr),
     _monitorTaskHandle(nullptr),
     _scanTaskHandle(nullptr),
@@ -154,6 +161,8 @@ WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, const S
   _connectionMutex = xSemaphoreCreateMutex();
   _networksMutex   = xSemaphoreCreateMutex();
   _connectingMutex = xSemaphoreCreateMutex();
+  // Create new mutex for WiFi operations
+  _wifiMutex = xSemaphoreCreateMutex();
 
   // Set the singleton instance and register the WiFi event handler.
   _instance = this;
@@ -161,7 +170,7 @@ WiFiManager::WiFiManager(const String& apSsid, const String& apPassword, const S
 }
 
 WiFiManager::~WiFiManager() {
-  if (_managerTaskHandle) vTaskDelete(_managerTaskHandle);
+  if (_connectionManagerTaskHandle) vTaskDelete(_connectionManagerTaskHandle);
   if (_serverTaskHandle) vTaskDelete(_serverTaskHandle);
   if (_monitorTaskHandle) vTaskDelete(_monitorTaskHandle);
   if (_scanTaskHandle) vTaskDelete(_scanTaskHandle);
@@ -171,6 +180,8 @@ WiFiManager::~WiFiManager() {
   if (_connectionMutex) vSemaphoreDelete(_connectionMutex);
   if (_connectingMutex) vSemaphoreDelete(_connectingMutex);
   if (_networksMutex)  vSemaphoreDelete(_networksMutex);
+  // Delete WiFi mutex
+  if (_wifiMutex) vSemaphoreDelete(_wifiMutex);
   stopAPMode();
   if (_instance == this) _instance = nullptr;
 }
@@ -243,31 +254,24 @@ void WiFiManager::begin(bool runServerOnSeparateCore, int serverCore, int manage
   _monitorTaskDelay = monitorTaskDelay;
   _scanTaskDelay = scanTaskDelay;
 
-  // Initialize SPIFFS if a web directory is specified.
-  if (!_webDir.isEmpty()) {
-    if (!SPIFFS.begin(true)) {
-      Serial.println("WiFiManager: SPIFFS Mount Failed");
-    }
-  }
-
   Serial.println("WiFiManager: Starting asynchronous initialization...");
 
-  // Create the manager task.
+  // Create the persistent connection manager task.
   BaseType_t result = xTaskCreatePinnedToCore(
-    managerTask,
-    "WiFiManagerTask",
+    connectionManagerTask,
+    "WiFiConnMgrTask",
     8192,
     this,
     1,
-    &_managerTaskHandle,
+    &_connectionManagerTaskHandle,
     _managerCore
   );
   if (result != pdPASS) {
-    Serial.println("WiFiManager: Failed to create manager task.");
-    _managerTaskHandle = nullptr;
+    Serial.println("WiFiManager: Failed to create connection manager task.");
+    _connectionManagerTaskHandle = nullptr;
   }
 
-  // Create the monitor task for automatic reconnection.
+  // Create the monitor task for checking connectivity.
   result = xTaskCreatePinnedToCore(
     monitorTask,
     "WiFiMonitorTask",
@@ -322,47 +326,72 @@ bool WiFiManager::tryConnect(const String &ssid, const String &password) {
   _currentPassword = password;
 
   updateStatus(WiFiStatus::TRYING_TO_CONNECT);
-  Serial.printf("WiFiManager: Attempting to connect to %s   %s\n", ssid.c_str(), password.c_str());
+  Serial.printf("WiFiManager: Attempting to connect to %s\n", ssid.c_str());
+  
+  // Use WiFi mutex to ensure exclusive access during connection attempts.
+  xSemaphoreTake(_wifiMutex, portMAX_DELAY);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid.c_str(), password.c_str());
+  xSemaphoreGive(_wifiMutex);
   
   // Brief delay to allow the connection attempt to start.
   vTaskDelay(pdMS_TO_TICKS(100));
   xSemaphoreGive(_connectingMutex);
   return true;
 }
-
-//--------------------------------------------------------------------------
-// SPIFFS and File Serving Helpers
-//--------------------------------------------------------------------------
-
-String WiFiManager::loadFileFromSPIFFS(const String& filePath) {
-  File file = SPIFFS.open(filePath, "r");
-  if (!file || file.isDirectory()) {
-    Serial.printf("WiFiManager: Failed to open file: %s\n", filePath.c_str());
-    return "";
-  }
-  String content = file.readString();
-  file.close();
-  return content;
+bool WiFiManager::resetWiFi() {
+    xSemaphoreTake(_wifiMutex, portMAX_DELAY);
+    
+    Serial.println("WiFiManager: Performing full WiFi reset...");
+    
+    // Force disconnect and disable interfaces
+    WiFi.disconnect(true, true);  // Disconnect + disable STA
+    WiFi.enableAP(false);
+    delay(100);
+    
+    // Clear persistent settings
+    WiFi.persistent(false);
+    WiFi.setAutoConnect(false);
+    WiFi.setAutoReconnect(false);
+    
+    // ESP-IDF level cleanup
+    esp_wifi_deinit();
+    esp_wifi_stop();
+    delay(100);
+    
+    // Reinitialize WiFi with default config
+    WiFi.mode(WIFI_MODE_NULL);
+    
+    // Create and initialize default config
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    
+    xSemaphoreGive(_wifiMutex);
+    
+    Serial.println("WiFiManager: WiFi stack fully reset");
+    return true;
 }
 
-String WiFiManager::getFileContent(const String& fileName, const char* defaultContent) {
-  if (!_webDir.isEmpty()) {
-    String fullPath = _webDir + "/" + fileName;
-    String content = loadFileFromSPIFFS(fullPath);
-    if (!content.isEmpty()) {
-      return content;
-    } else {
-      Serial.printf("WiFiManager: File %s not found in SPIFFS, falling back to default.\n", fullPath.c_str());
-    }
-  }
-  return String(defaultContent);
-}
-
-void WiFiManager::setupStaticEndpoint(const String& uri, const String& fileName, const char* defaultContent, const char* contentType) {
-  _server->on(uri.c_str(), [this, fileName, defaultContent, contentType]() {
-    String content = getFileContent(fileName, defaultContent);
-    _server->send(200, contentType, content);
+//--------------------------------------------------------------------------
+// Web Server Helpers (Default Embedded Web Files)
+//--------------------------------------------------------------------------
+void WiFiManager::setupDefaultEndpoints() {
+  // Setup endpoints to serve the default embedded HTML, CSS, and JS files.
+  _server->on("/", [this]() {
+    _server->send(200, "text/html", defaultIndexHtml);
+  });
+  _server->on("/index.html", [this]() {
+    _server->send(200, "text/html", defaultIndexHtml);
+  });
+  _server->on("/connect", [this]() {
+    _server->send(200, "text/html", defaultConnectHtml);
+  });
+  _server->on("/style.css", [this]() {
+    _server->send(200, "text/css", defaultStyleCss);
+  });
+  _server->on("/script.js", [this]() {
+    _server->send(200, "application/javascript", defaultScriptJs);
   });
 }
 
@@ -477,12 +506,8 @@ void WiFiManager::startAPMode() {
   }
   _server = new WebServer(80);
 
-  // Setup static endpoints for serving files.
-  setupStaticEndpoint("/", "index.html", defaultIndexHtml, "text/html");
-  setupStaticEndpoint("/index.html", "index.html", defaultIndexHtml, "text/html");
-  setupStaticEndpoint("/connect", "connect.html", defaultConnectHtml, "text/html");
-  setupStaticEndpoint("/style.css", "style.css", defaultStyleCss, "text/css");
-  setupStaticEndpoint("/script.js", "script.js", defaultScriptJs, "application/javascript");
+  // Setup default endpoints to serve embedded web files.
+  setupDefaultEndpoints();
 
   // Endpoint to return cached WiFi networks as JSON.
   _server->on("/wifinetworks", [this]() { handleWifiNetworks(); });
@@ -608,61 +633,71 @@ void WiFiManager::handleWifiNetworks() {
 // Task Functions
 //--------------------------------------------------------------------------
 
-void WiFiManager::managerTask(void* param) {
+/**
+ * @brief Persistent connection manager task.
+ *
+ * This task continuously monitors the connection status. If not connected
+ * (and not in a NO_INTERNET state), it checks for pending credentials first,
+ * then attempts stored credentials (only once per disconnection). The actual
+ * connection attempt is done via a helper lambda that calls tryConnect() and
+ * waits (non-blocking) for a notification from the WiFi event callback.
+ */
+void WiFiManager::connectionManagerTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
-  String storedSsid, storedPassword, newSsid, newPassword;
-
-  // Try stored credentials first.
-  if (manager->loadLastCredentials(storedSsid, storedPassword)) {
-    manager->tryConnect(storedSsid, storedPassword);
-    uint32_t startTime = xTaskGetTickCount();
-    bool connected = false;
-    while (xTaskGetTickCount() - startTime < pdMS_TO_TICKS(manager->_connectTimeout)) {
-      if (manager->safeGetStatus() == WiFiStatus::CONNECTED) {
-        connected = true;
-        break;
+  bool attemptedStored = false;
+  static const int MAX_RETRIES = 5;
+  // Helper lambda for attempting a connection.
+  auto attemptConnection = [manager](const String &ssid, const String &password, const char* type) -> bool {
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      Serial.printf("WiFiManager: Attempt %d to connect with %s credentials: %s\n", attempt + 1, type, ssid.c_str());
+      // Ensure autoReconnect is enabled.
+      WiFi.disconnect(false, false);
+      manager->tryConnect(ssid, password);
+      xTaskNotifyStateClear(NULL);
+      if (xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(manager->_connectTimeout)) == pdTRUE) {
+        if (manager->safeGetStatus() == WiFiStatus::CONNECTED)
+          return true;
       }
       vTaskDelay(pdMS_TO_TICKS(100));
+      Serial.printf("WiFiManager: Attempt %d failed.\n", attempt + 1);
     }
-    if (connected) {
-      Serial.println("WiFiManager: Connected using stored credentials.");
-      manager->stopAPMode();
-      vTaskDelete(NULL);
-      return;
-    } else {
-      Serial.println("WiFiManager: Stored credentials failed within timeout.");
+    return false;
+  };
+
+  manager->resetWiFi();
+
+  for (;;) {
+    // If already connected (or in NO_INTERNET state), reset flag.
+    if (manager->safeGetStatus() == WiFiStatus::CONNECTED ||
+        manager->safeGetStatus() == WiFiStatus::NO_INTERNET) {
+      attemptedStored = false;
+      vTaskDelay(pdMS_TO_TICKS(manager->_managerTaskDelay));
+      continue;
     }
-  } else {
-    Serial.println("WiFiManager: No stored credentials found.");
-  }
-
-  // Activate AP mode for new credentials.
-  manager->ensureAPModeActive();
-
-  while (true) {
+    // Try pending credentials first.
+    String newSsid, newPassword;
     if (manager->fetchPendingCredentials(newSsid, newPassword)) {
-      manager->tryConnect(newSsid, newPassword);
-      uint32_t startTime = xTaskGetTickCount();
-      bool connected = false;
-      while (xTaskGetTickCount() - startTime < pdMS_TO_TICKS(manager->_connectTimeout)) {
-        if (manager->safeGetStatus() == WiFiStatus::CONNECTED) {
-          connected = true;
-          break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
+      if (!attemptConnection(newSsid, newPassword, "pending")) {
+        Serial.println("WiFiManager: Pending credentials connection failed.");
+        manager->ensureAPModeActive();
       }
-      if (connected) {
-        Serial.println("WiFiManager: Connected using new credentials.");
-        manager->stopAPMode();
-        break;
+    }
+    // Otherwise, try stored credentials if not yet attempted.
+    else if (!attemptedStored) {
+      String storedSsid, storedPassword;
+      if (manager->loadLastCredentials(storedSsid, storedPassword)) {
+        if (!attemptConnection(storedSsid, storedPassword, "stored")) {
+          Serial.println("WiFiManager: Stored credentials connection failed.");
+          manager->ensureAPModeActive();
+        }
+        attemptedStored = true;
       } else {
-        Serial.println("WiFiManager: New credentials failed within timeout.");
+        // No stored credentials; force AP mode.
         manager->ensureAPModeActive();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(manager->_managerTaskDelay));
   }
-  vTaskDelete(NULL);
 }
 
 void WiFiManager::serverTask(void* param) {
@@ -680,15 +715,7 @@ void WiFiManager::monitorTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
     Serial.printf("WiFiManager monitorTask: Current status: %s\n", manager->wifiStatusToString(manager->safeGetStatus()));
-    if (manager->safeGetStatus() == WiFiStatus::AP_MODE_ACTIVE) {
-      if (WiFi.getMode() != WIFI_AP_STA) {
-        Serial.println("FATAL WiFiManager: AP mode is active but not in AP+STA mode.");
-      }
-      String storedSsid, storedPassword;
-      if (_instance->loadLastCredentials(storedSsid, storedPassword)) {
-        _instance->tryConnect(storedSsid, storedPassword);
-      }
-    }
+    // Only monitor internet connectivity.
     if (manager->safeGetStatus() == WiFiStatus::CONNECTED && !manager->hasInternetAccess()) {
       manager->updateStatus(WiFiStatus::NO_INTERNET);
     }
@@ -703,12 +730,26 @@ void WiFiManager::monitorTask(void* param) {
 void WiFiManager::scanTask(void* param) {
   WiFiManager* manager = static_cast<WiFiManager*>(param);
   for (;;) {
+    // Use WiFi mutex to prevent concurrent operations.
+    xSemaphoreTake(manager->_wifiMutex, portMAX_DELAY);
+    Serial.println("[WM] Starting WiFi scan...");
     int ret = WiFi.scanNetworks(true);
-    while (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
-      vTaskDelay(pdMS_TO_TICKS(100));
+    if(ret == WIFI_SCAN_RUNNING) {
+      Serial.println("[WM] Scan initiated asynchronously.");
+    }
+    // Clear any previous notifications.
+    xTaskNotifyStateClear(NULL);
+    // Wait for scan completion notification from the WiFi event handler,
+    // with a timeout of 10 seconds.
+    BaseType_t notifyResult = xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(10000));
+    if (notifyResult == pdTRUE) {
+       Serial.println("[WM] Scan notification received.");
+    } else {
+       Serial.println("[WM] Scan notification timeout.");
     }
     int n = WiFi.scanComplete();
-    if (n >= 0) {
+    Serial.printf("[WM] WiFi scan complete, found %d networks.\n", n);
+    if(n >= 0) {
       std::vector<WiFiNetwork> tempNetworks;
       for (int i = 0; i < n; i++) {
         WiFiNetwork net;
@@ -716,12 +757,15 @@ void WiFiManager::scanTask(void* param) {
         net.rssi = WiFi.RSSI(i);
         tempNetworks.push_back(net);
       }
-      if (xSemaphoreTake(manager->_networksMutex, portMAX_DELAY) == pdTRUE) {
+      if(xSemaphoreTake(manager->_networksMutex, portMAX_DELAY) == pdTRUE) {
         manager->_cachedNetworks = tempNetworks;
         xSemaphoreGive(manager->_networksMutex);
       }
+    } else {
+      Serial.println("[WM] Scan failed or no networks found.");
     }
     WiFi.scanDelete();
+    xSemaphoreGive(manager->_wifiMutex);
     vTaskDelay(pdMS_TO_TICKS(manager->_scanTaskDelay));
   }
 }
@@ -762,10 +806,14 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
 
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf("WiFiManager Callback: Connected ARDUINO_EVENT_WIFI_STA_GOT_IP %s\n", WiFi.SSID().c_str());
+      Serial.printf("WiFiManager Callback: Got IP on SSID %s\n", WiFi.SSID().c_str());
       _instance->updateStatus(WiFiStatus::CONNECTED);
       _instance->saveLastCredentials(_instance->_currentSsid, _instance->_currentPassword);
       _instance->stopAPMode();
+      // Notify the connection manager of success.
+      if (_instance->_connectionManagerTaskHandle) {
+          xTaskNotifyGive(_instance->_connectionManagerTaskHandle);
+      }
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
@@ -773,7 +821,11 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
       Serial.printf("WiFiManager Callback: Disconnected from STA (reason %d)\n", reason);
       if (reason == WIFI_REASON_AUTH_FAIL || reason == WIFI_REASON_AUTH_EXPIRE) {
         Serial.println("WiFiManager Callback: Authentication failed. Disabling auto-reconnect.");
-        WiFi.setAutoReconnect(false);
+        // WiFi.setAutoReconnect(false);
+      }
+      // Notify the connection manager immediately so that waiting attempts wake up.
+      if (_instance->_connectionManagerTaskHandle) {
+          xTaskNotifyGive(_instance->_connectionManagerTaskHandle);
       }
       if (_instance->safeGetStatus() != WiFiStatus::AP_MODE_ACTIVE) {
         if (_instance->_autoLaunchAP) {
@@ -799,6 +851,10 @@ void WiFiManager::wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
       break;
     case ARDUINO_EVENT_WIFI_SCAN_DONE:
       Serial.println("WiFiManager Callback: Scan Done");
+      // Notify scan task that scan is complete.
+      if (_instance->_scanTaskHandle) {
+          xTaskNotifyGive(_instance->_scanTaskHandle);
+      }
       break;
     default:
       break;
