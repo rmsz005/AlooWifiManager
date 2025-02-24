@@ -1,16 +1,40 @@
-
-
 # AlooWifiManager
 
 AlooWifiManager is an asynchronous WiFi manager library for ESP32 projects built on the Arduino framework. It simplifies WiFi connection management by providing non-blocking, event-driven connection handling with automatic fallback to AP mode and a built-in captive portal for easy configuration.
 
 ## Features
 
-- **Asynchronous Connection Management:** Non-blocking tasks to connect and monitor WiFi status.
-- **Captive Portal:** Automatically switches to AP mode when connection fails, allowing users to submit new credentials via a web interface.
-- **Web Server Integration:** Built-in web server with endpoints for network scanning (`/wifinetworks`), connection status (`/status`), and credential submission (`/submit`).
-- **Persistent Credential Storage:** Saves and retrieves WiFi credentials using ESP32 Preferences.
-- **Customizable Parameters:** Configure connection timeouts, reconnection attempts, and task delays to fit your application’s needs.
+- **Asynchronous Connection Management:**  
+  Uses multiple FreeRTOS tasks to connect to WiFi, monitor connection status, and scan available networks without blocking your main application.
+
+- **Captive Portal:**  
+  Automatically switches to Access Point mode when stored credentials are invalid or absent, serving a customizable web portal for WiFi configuration.
+
+- **Web Server Integration:**  
+  Embeds an asynchronous web server that provides endpoints for network scanning (`/wifinetworks`), reporting connection status (`/status`), and accepting new credentials (`/submit`).
+
+- **Persistent Credential Storage:**  
+  Utilizes ESP32 Preferences to save and retrieve WiFi credentials and custom parameters across reboots.
+
+- **Customizable Parameters:**  
+  Allows configuration of connection timeouts, reconnection attempts, task delays, and other runtime parameters to tailor the behavior for different applications.
+
+## Planned Improvements (TODO)
+
+- **Add Timeouts:**  
+  Implement configurable timeouts for WiFi connection attempts and captive portal sessions to improve system responsiveness.
+
+- **ESP8266 Compatibility:**  
+  Extend support to the ESP8266 platform ensuring the core functionalities are portable across both ESP32 and ESP8266.
+
+- **Add Event Callbacks:**  
+  Provide user-defined callback hooks for events such as successful connection, configuration changes, and error conditions to enhance integration flexibility.
+
+- **Optimize Task Management:**  
+  Refine task scheduling and reduce dynamic task creation by exploring static task allocation or task pooling to lower overhead and prevent memory fragmentation.
+
+- **Improve Memory Management:**  
+  Enhance resource utilization by moving embedded web files to PROGMEM or a filesystem like LittleFS and using static allocation for tasks and synchronization objects where feasible.
 
 ## Installation
 
@@ -22,10 +46,11 @@ AlooWifiManager is an asynchronous WiFi manager library for ESP32 projects built
 
 2. **Include in Your Project:**
    - Copy `AlooWifiManager.h` and `AlooWifiManager.cpp` into your Arduino project directory.
-   - Ensure you have the Arduino core for ESP32 installed along with required libraries (SPIFFS, FreeRTOS).
+   - Ensure you have the ESP32 Arduino core installed along with required libraries (SPIFFS, FreeRTOS).
 
-Or as platformio dependency
-```
+Or as a PlatformIO dependency:
+
+```ini
 lib_deps =
     https://github.com/rmsz005/AlooWifiManager
 ```
@@ -41,7 +66,6 @@ Include the library and initialize it in your `setup()` function:
 #include "AlooWifiManager.h"
 
 // Create an instance of WiFiManager with custom AP credentials.
-// (Parameters: AP SSID, AP Password, SPIFFS web directory)
 WiFiManager wifiManager("ESP32-Config", "", "");
 
 void setup() {
@@ -58,7 +82,7 @@ void loop() {
 
 ### Advanced Example
 
-For a more complete example, including performance stats and an HTTP call upon connection:
+For a more complete example—including performance stats and an HTTP call upon connection—see below:
 
 ```cpp
 #include <Arduino.h>
@@ -72,7 +96,7 @@ void performInitSessionCall() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   WiFiClientSecure sslClient;
-  sslClient.setInsecure(); // Note: Use secure method in production
+  sslClient.setInsecure(); // Note: Use a proper certificate in production
 
   HTTPClient https;
   https.setTimeout(8000);
@@ -97,7 +121,6 @@ void setup() {
 }
 
 void loop() {
-
   if (wifiManager.getStatus() == WiFiStatus::CONNECTED) {
     performInitSessionCall();
     delay(10000); // Delay between HTTP calls
@@ -116,5 +139,5 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Acknowledgments
 
 - Built using the ESP32 Arduino core and FreeRTOS.
-- Inspired by various WiFi management solutions available for ESP32.
+- Inspired by various WiFi management solutions available for ESP32 and ESP8266.
 
