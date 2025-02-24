@@ -36,6 +36,9 @@ AlooWifiManager is an asynchronous WiFi manager library for ESP32 projects built
 - **Improve Memory Management:**  
   Enhance resource utilization by moving embedded web files to PROGMEM or a filesystem like LittleFS and using static allocation for tasks and synchronization objects where feasible.
 
+![image](https://github.com/user-attachments/assets/2d90f2a7-2a39-4607-977f-6e2b66f7f844)
+![image](https://github.com/user-attachments/assets/b591d4f1-7928-4e3d-92cc-5b1efae3ec3c)
+
 ## Installation
 
 1. **Clone the Repository:**
